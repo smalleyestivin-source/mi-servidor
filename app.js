@@ -1817,19 +1817,9 @@ app.post('/api/voces/clonar', limitador, uploadMultiple.any(), (req, res) => {
 // ============================================================
 // Logs de inicio
 // ============================================================
-console.log('✅ Módulo de biblioteca de voces cargado');
-console.log(`📁 Voces en: ${VOICES_DIR}`);
-console.log(`💾 DB en:    ${DB_FILE}`);
-console.log('');
-console.log('Endpoints disponibles:');
-console.log('  GET    /api/voces              — Listar (filtros: genero, categoria, idioma, buscar, orden)');
-console.log('  GET    /api/voces/:id          — Detalle + reseñas');
-console.log('  POST   /api/voces/subir        — Subir nueva voz');
-console.log('  POST   /api/voces/:id/usar     — Registrar uso');
-console.log('  POST   /api/voces/:id/review   — Agregar reseña');
-console.log('  DELETE /api/voces/:id          — Eliminar voz');
-console.log('  GET    /api/voces/stats/resumen — Estadísticas');
-console.log('  POST   /api/voces/clonar       — Guardar grabaciones para clonar');
+log('✅ Módulo de biblioteca de voces cargado', 'exito');
+log(`📁 Voces en: ${VOICES_DIR}`, 'info');
+log('📦 Base de datos de voces: MongoDB (o memoria si no hay MONGODB_URI)', 'info');
 
 // ============================================================
 // FIN DEL MÓDULO
