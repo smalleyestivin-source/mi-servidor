@@ -14,6 +14,7 @@ const os = require('os');
 const { buscarImagenes } = require('./buscar-imagenes');
 const { buscarOEsperar, revisarMatch, cancelarBusqueda } = require('./matchmaking');
 const { buscarWeb, buscarVideos } = require('./buscar-web');
+const vozSilabas = require('./voz-silabas');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1000,7 +1001,42 @@ app.post('/api/matchmaking/cancelar', async (req, res) => {
     }
 });
 
-// ── Búsqueda web (SearXNG, con caché permanente) ──
+// ── Voz por sílabas (versión gratuita, sin GPU) ──
+app.get('/api/voz-silabas/lista', (req, res) => {
+    res.json({ exito: true, silabas: vozSilabas.listaSilabas() });
+});
+
+app.post('/api/voz-silabas/:vozId/grabar/:silaba', vozSilabas.upload.single('audio'), async (req, res) => {
+    if (!req.file) return res.status(400).json({ exito: false, error: 'No se recibió audio' });
+    const { vozId, silaba } = req.params;
+    if (!vozSilabas.listaSilabas().includes(silaba)) {
+        return res.status(400).json({ exito: false, error: 'Esa sílaba no está en la lista' });
+    }
+    await vozSilabas.guardarSilaba(vozId, silaba, req.file.buffer);
+    const grabadas = vozSilabas.silabasGrabadas(vozId);
+    res.json({
+        exito: true,
+        silaba,
+        progreso: `${grabadas.length}/${vozSilabas.listaSilabas().length}`
+    });
+});
+
+app.get('/api/voz-silabas/:vozId/progreso', (req, res) => {
+    const grabadas = vozSilabas.silabasGrabadas(req.params.vozId);
+    res.json({ exito: true, grabadas: grabadas.length, total: vozSilabas.listaSilabas().length, faltan: vozSilabas.listaSilabas().filter(s => !grabadas.includes(s)) });
+});
+
+app.post('/api/voz-silabas/:vozId/generar', async (req, res) => {
+    const { texto, factorTono, factorVelocidad } = req.body;
+    if (!texto) return res.status(400).json({ exito: false, error: 'Falta el texto' });
+    const resultado = await vozSilabas.generarConSilabas(req.params.vozId, texto, {
+        factorTono: parseFloat(factorTono) || 1.0,
+        factorVelocidad: parseFloat(factorVelocidad) || 1.0
+    });
+    res.json(resultado);
+});
+
+
 app.get('/api/buscar-web', async (req, res) => {
     const termino = req.query.q;
     if (!termino) return res.status(400).json({ exito: false, error: 'Falta el parámetro ?q=' });
@@ -1228,6 +1264,77 @@ app.get('/api/personajes', (req, res) => {
   });
 });
 
+// ── Cascada de TTS: Fish Audio → FreeTTS → Google (no oficial) ──
+// Aviso honesto: Fish Audio hoy (2026) tiene una promoción de acceso
+// gratis a su mejor modelo, pero es promocional, no garantizada para
+// siempre — y su plan gratis normal es solo para uso personal, no
+// comercial. Si un día deja de responder o cambia sus términos, la
+// cascada simplemente cae a las siguientes opciones sin romper nada.
+async function generarAudioFishAudio(texto, idioma) {
+    const key = process.env.FISH_AUDIO_API_KEY;
+    if (!key) throw new Error('Sin FISH_AUDIO_API_KEY configurada');
+    const res = await fetch('https://api.fish.audio/v1/tts', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: texto, format: 'mp3' })
+    });
+    if (!res.ok) throw new Error('Fish Audio respondió ' + res.status);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (!buffer.length) throw new Error('Fish Audio devolvió audio vacío');
+    return buffer;
+}
+
+async function generarAudioFreeTTS(texto, idioma) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (process.env.FREETTS_API_KEY) headers['x-api-key'] = process.env.FREETTS_API_KEY;
+    const res = await fetch('https://freetts.org/api/v1/tts', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ text: texto, language: idioma })
+    });
+    if (!res.ok) throw new Error('FreeTTS respondió ' + res.status);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (!buffer.length) throw new Error('FreeTTS devolvió audio vacío');
+    return buffer;
+}
+
+async function generarAudioGoogle(texto, idioma) {
+    const chunks = [];
+    let chunk = '';
+    for (const p of texto.split(' ')) {
+        if ((chunk + ' ' + p).length > 190) { if (chunk) chunks.push(chunk.trim()); chunk = p; }
+        else chunk += ' ' + p;
+    }
+    if (chunk.trim()) chunks.push(chunk.trim());
+
+    const buffers = [];
+    for (const c of chunks) {
+        const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(c)}&tl=${idioma}&client=gtx`;
+        buffers.push(await fetchBuffer(url));
+    }
+    return Buffer.concat(buffers);
+}
+
+async function generarAudioConCascada(texto, idioma) {
+    const motores = [
+        { nombre: 'Fish Audio', fn: generarAudioFishAudio },
+        { nombre: 'FreeTTS', fn: generarAudioFreeTTS },
+        { nombre: 'Google (no oficial)', fn: generarAudioGoogle }
+    ];
+    let ultimoError = null;
+    for (const motor of motores) {
+        try {
+            const audio = await motor.fn(texto, idioma);
+            return { audio, motor: motor.nombre };
+        } catch (e) {
+            log(`⚠️ ${motor.nombre} falló para TTS: ${e.message}`, 'warning');
+            ultimoError = e;
+            continue;
+        }
+    }
+    throw ultimoError || new Error('Ningún motor de voz respondió');
+}
+
 app.post('/api/tts', async (req, res) => {
   const { texto, idioma = 'es', personaje, categoria } = req.body;
   if (!texto || !texto.trim()) return res.status(400).json({ error: 'Texto requerido' });
@@ -1235,27 +1342,15 @@ app.post('/api/tts', async (req, res) => {
   let config = { clientRate: 1.0, clientPitch: 1.0 };
   if (personaje && categoria && PERSONAJES[categoria]?.[personaje]) config = PERSONAJES[categoria][personaje];
 
-  const chunks = [];
-  let chunk = '';
-  for (const p of texto.split(' ')) {
-    if ((chunk + ' ' + p).length > 190) { if (chunk) chunks.push(chunk.trim()); chunk = p; }
-    else chunk += ' ' + p;
-  }
-  if (chunk.trim()) chunks.push(chunk.trim());
-
   const lang = idioma.split('-')[0];
   try {
-    const audioBuffers = [];
-    for (const c of chunks) {
-      const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(c)}&tl=${lang}&client=gtx`;
-      audioBuffers.push(await fetchBuffer(url));
-    }
-    const audioTotal = Buffer.concat(audioBuffers);
+    const { audio, motor } = await generarAudioConCascada(texto, lang);
     res.set({
-      'Content-Type': 'audio/mpeg', 'Content-Length': audioTotal.length, 'Cache-Control': 'no-cache',
-      'X-Client-Rate': config.clientRate, 'X-Client-Pitch': config.clientPitch
+      'Content-Type': 'audio/mpeg', 'Content-Length': audio.length, 'Cache-Control': 'no-cache',
+      'X-Client-Rate': config.clientRate, 'X-Client-Pitch': config.clientPitch,
+      'X-Motor-TTS': motor
     });
-    res.send(audioTotal);
+    res.send(audio);
   } catch(e) {
     res.status(500).json({ error: 'Error generando audio: ' + e.message });
   }
