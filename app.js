@@ -1056,46 +1056,10 @@ app.get('/api/buscar-videos', async (req, res) => {
     res.json(await buscarVideos(termino));
 });
 
-// ── Buscador del VS Code Marketplace (proxy, sin límite de CORS) ──
-app.post('/api/marketplace-search', async (req, res) => {
-    try {
-        const query = (req.body && typeof req.body.query === 'string') ? req.body.query.slice(0, 200) : '';
-
-        const body = {
-            filters: [{
-                criteria: [
-                    { filterType: 8, value: 'Microsoft.VisualStudio.Code' },
-                    { filterType: 10, value: query || 'popular extensions' }
-                ],
-                pageNumber: 1,
-                pageSize: 20,
-                sortBy: query ? 0 : 4,
-                sortOrder: 0
-            }],
-            assetTypes: [],
-            flags: 914 // incluye, entre otras cosas, los links de descarga directa del .vsix
-        };
-
-        const upstream = await fetch('https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json;api-version=3.0-preview.1'
-            },
-            body: JSON.stringify(body)
-        });
-
-        if (!upstream.ok) {
-            return res.status(502).json({ error: 'upstream_error', status: upstream.status });
-        }
-
-        const data = await upstream.json();
-        res.json(data);
-
-    } catch (err) {
-        console.error('Error en /api/marketplace-search:', err);
-        res.status(500).json({ error: 'proxy_error', message: String(err) });
-    }
+// El buscador del Marketplace de Microsoft se quitó: sus términos de uso no permiten
+// usarlo desde aplicaciones que no sean de Microsoft.
+app.post('/api/marketplace-search', (req, res) => {
+    res.status(410).json({ error: 'desactivado', message: 'Buscador del Marketplace de VS Code desactivado.' });
 });
 
 app.get('/health', (req, res) => {
