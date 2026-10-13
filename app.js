@@ -13,10 +13,12 @@ const path = require('path');
 const os = require('os');
 const { buscarImagenes } = require('./buscar-imagenes');
 const { buscarOEsperar, revisarMatch, cancelarBusqueda } = require('./matchmaking');
+const { iniciarMonitor, agregarRutasMonitor } = require('./agente-monitor');
 const { buscarWeb, buscarVideos } = require('./buscar-web');
 const vozSilabas = require('./voz-silabas');
 
 const app = express();
+app.set('trust proxy', 1); // Render va detrás de un proxy: así req.ip es la IP real del visitante
 const PORT = process.env.PORT || 3000;
 
 // ── Middleware ──
@@ -38,6 +40,10 @@ const peerServer = ExpressPeerServer(httpServer, {
     allow_discovery: false // evita que cualquiera liste los peers conectados
 });
 app.use('/peerjs', peerServer);
+
+// ── Puente IDE ⇄ IA (MCP): WebSocket /ide-bridge y MCP /mcp/<código> ──
+const { attachMcpBridge } = require('./mcp-bridge');
+attachMcpBridge(app, httpServer);
 
 // ── Logging ──
 const log = (msg, type = 'info') => {
@@ -1105,6 +1111,9 @@ app.get('/health', (req, res) => {
 // 5. INICIAR SERVIDOR
 // ============================================================
 
+// ── Agente Monitor ──
+agregarRutasMonitor(app);
+
 httpServer.listen(PORT, '0.0.0.0', () => {
     log(`🚀 Servidor definitivo iniciado`, 'exito');
     log(`📡 Puerto: ${PORT}`, 'info');
@@ -1112,6 +1121,9 @@ httpServer.listen(PORT, '0.0.0.0', () => {
     log(`📱 Red: http://${getLocalIP()}:${PORT}`, 'info');
     log(`📊 Servicios cargados: ${Object.keys(gestor.servicios).length}`, 'info');
     log(`🎮 Señalización PeerJS propia en: /peerjs`, 'info');
+
+    // Iniciar agente monitor después de que el servidor esté listo
+    setTimeout(() => iniciarMonitor(), 5000);
 });
 
 // ── Obtener IP local ──
@@ -1782,37 +1794,124 @@ const uploadMultiple = multer({
 // el disco temporal de Render — se pierden si el servicio reinicia. Como es
 // contenido "pendiente de procesar" (no el catálogo final), es menos grave
 // que perder la base de datos, pero igual vale la pena saberlo.
-app.post('/api/voces/clonar', limitador, uploadMultiple.any(), (req, res) => {
+// ── Clonar voz de verdad con Fish Audio ──
+// Sube las muestras del usuario a Fish Audio (/model), que entrena un
+// modelo reutilizable y regresa un voice_id. Ese id se guarda como una
+// voz más en tu biblioteca (MongoDB) — de ahí en adelante se usa igual
+// que cualquier otra voz, solo que suena como la persona real.
+async function crearVozClonadaFishAudio(archivos, titulo) {
+    const key = process.env.FISH_AUDIO_API_KEY;
+    if (!key) throw new Error('Falta FISH_AUDIO_API_KEY — sin ella no se puede clonar de verdad, solo guardar');
+
+    const form = new FormData();
+    form.append('type', 'tts');
+    form.append('title', titulo);
+    form.append('visibility', 'private');
+    form.append('train_mode', 'fast');
+    for (const archivo of archivos) {
+        const datos = fs.readFileSync(archivo.path); // diskStorage: el contenido vive en disco, no en .buffer
+        form.append('voices', new Blob([datos]), archivo.originalname || archivo.filename || 'muestra.wav');
+    }
+
+    const res = await fetch('https://api.fish.audio/model', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${key}` },
+        body: form
+    });
+
+    if (!res.ok) {
+        const detalle = await res.text();
+        throw new Error(`Fish Audio no pudo crear el modelo (${res.status}): ${detalle}`);
+    }
+    return res.json(); // incluye _id (el voice_id) y state
+}
+
+app.post('/api/voces/clonar', limitador, uploadMultiple.any(), async (req, res) => {
   const { nombre = 'Voz clonada', creador = 'Anónimo', idioma = 'es' } = req.body;
-  const id = crypto.randomBytes(10).toString('hex');
 
-  // Guardar metadata de la voz a clonar
-  const clonesDir = path.join(VOICES_DIR, 'clones', id);
-  fs.mkdirSync(clonesDir, { recursive: true });
+  if (!req.files || !req.files.length) {
+    return res.status(400).json({ exito: false, error: 'No se recibió ninguna grabación' });
+  }
 
-  const meta = {
-    id,
-    nombre,
-    creador,
-    idioma,
-    archivos: req.files.map(f => f.filename),
-    fecha: new Date().toISOString(),
-    estado: 'pendiente'
-    // TODO: cuando se integre Coqui TTS o RVC:
-    // 1. Enviar los archivos a proceso de entrenamiento
-    // 2. Guardar el modelo resultante
-    // 3. Actualizar estado a 'lista'
-  };
+  try {
+    const modelo = await crearVozClonadaFishAudio(req.files, nombre);
 
-  fs.writeFileSync(path.join(clonesDir, 'meta.json'), JSON.stringify(meta, null, 2));
+    // Se guarda como una voz más en tu biblioteca de siempre —
+    // aparece en /api/voces igual que las demás.
+    const voz = {
+      id: crypto.randomBytes(12).toString('hex'),
+      nombre,
+      creador,
+      idioma,
+      genero: 'clonada',
+      categoria: 'clonada',
+      descripcion: `Voz clonada a partir de ${req.files.length} grabación(es)`,
+      tipo: 'clonada',
+      fishVoiceId: modelo._id,          // ← esto es lo que la hace real
+      estadoClon: modelo.state || 'entrenando',
+      fecha: new Date().toISOString(),
+      activa: true
+    };
 
-  res.json({
-    exito: true,
-    id,
-    mensaje: 'Grabaciones recibidas. La voz clonada estará lista próximamente.',
-    archivos: req.files.length
-  });
+    await guardarVoz(voz);
+
+    res.json({
+      exito: true,
+      voz,
+      mensaje: modelo.state === 'ready'
+        ? 'Voz clonada y lista para usar ya mismo'
+        : 'Voz en entrenamiento — puede tardar unos minutos en estar lista'
+    });
+
+  } catch (e) {
+    // Si no hay key de Fish Audio configurada, no truena — se guarda
+    // igual que antes (pendiente), como respaldo honesto.
+    if (e.message.includes('FISH_AUDIO_API_KEY')) {
+      const id = crypto.randomBytes(10).toString('hex');
+      const clonesDir = path.join(VOICES_DIR, 'clones', id);
+      fs.mkdirSync(clonesDir, { recursive: true });
+      fs.writeFileSync(path.join(clonesDir, 'meta.json'), JSON.stringify({
+        id, nombre, creador, idioma, archivos: req.files.map(f => f.originalname),
+        fecha: new Date().toISOString(), estado: 'pendiente_sin_key'
+      }, null, 2));
+      return res.json({
+        exito: true, id, clonadoReal: false,
+        mensaje: 'Grabaciones guardadas, pero falta FISH_AUDIO_API_KEY para clonar de verdad — por ahora solo quedaron almacenadas.'
+      });
+    }
+    res.status(500).json({ exito: false, error: e.message });
+  }
 });
+
+// ── Generar audio con una voz clonada específica ──
+app.post('/api/voces/:id/hablar', async (req, res) => {
+  const { texto } = req.body;
+  if (!texto) return res.status(400).json({ exito: false, error: 'Falta el texto' });
+
+  const db = await leerDB();
+  const voz = db.voces.find(v => v.id === req.params.id);
+  if (!voz) return res.status(404).json({ exito: false, error: 'Voz no encontrada' });
+  if (!voz.fishVoiceId) return res.status(400).json({ exito: false, error: 'Esta voz no tiene un clon real de Fish Audio asociado' });
+
+  const key = process.env.FISH_AUDIO_API_KEY;
+  if (!key) return res.status(500).json({ exito: false, error: 'Falta FISH_AUDIO_API_KEY en el servidor' });
+
+  try {
+    const upstream = await fetch('https://api.fish.audio/v1/tts', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: texto, reference_id: voz.fishVoiceId, format: 'mp3' })
+    });
+    if (!upstream.ok) throw new Error('Fish Audio respondió ' + upstream.status);
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    res.set({ 'Content-Type': 'audio/mpeg', 'Content-Length': buffer.length });
+    res.send(buffer);
+  } catch (e) {
+    res.status(500).json({ exito: false, error: e.message });
+  }
+});
+
+
 
 // ============================================================
 // Logs de inicio
