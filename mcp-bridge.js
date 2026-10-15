@@ -328,13 +328,22 @@ function attachMcpBridge(app, server) {
 
   // WebSocket del IDE: /ide-bridge
   const wss = new WebSocketServer({ noServer: true, maxPayload: 6 * 1024 * 1024 });
+  // IMPORTANTE: PeerJS (y cualquier servidor ws con "path") rechaza con HTTP 400 todo
+  // upgrade que no sea de su ruta, así que NO basta con añadir otro listener: se
+  // cortaría la conexión de /ide-bridge. Por eso tomamos los listeners 'upgrade' que
+  // ya existen y ponemos UN solo despachador que reparte por ruta.
+  const otrosUpgrade = server.listeners('upgrade');
+  server.removeAllListeners('upgrade');
   server.on('upgrade', (req, socket, head) => {
     let pathname = '';
     try { pathname = new URL(req.url, 'http://x').pathname; } catch (_) {}
-    if (pathname !== '/ide-bridge') return; // otros listeners de upgrade siguen funcionando
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      bridge.onIdeSocket(ws, baseFromReq(req));
-    });
+    if (pathname === '/ide-bridge') {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        bridge.onIdeSocket(ws, baseFromReq(req));
+      });
+      return;
+    }
+    for (const fn of otrosUpgrade) fn.call(server, req, socket, head); // PeerJS y demás
   });
 
   // Servidor MCP remoto: POST /mcp/<CÓDIGO>
