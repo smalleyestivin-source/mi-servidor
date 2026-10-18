@@ -1056,10 +1056,38 @@ app.get('/api/buscar-videos', async (req, res) => {
     res.json(await buscarVideos(termino));
 });
 
-// El buscador del Marketplace de Microsoft se quitó: sus términos de uso no permiten
-// usarlo desde aplicaciones que no sean de Microsoft.
-app.post('/api/marketplace-search', (req, res) => {
-    res.status(410).json({ error: 'desactivado', message: 'Buscador del Marketplace de VS Code desactivado.' });
+// ── Buscador de extensiones: Open VSX (registro abierto) ──
+// No se usa el Marketplace de Microsoft: sus términos solo permiten usarlo con productos de Microsoft.
+// Formato que espera CodeIDE: { exito: true, resultados: [...] }. Si falla: { exito: false, error } y
+// CodeIDE busca directo en Open VSX por su cuenta.
+const MS_HOST_RE = /(^|\.)(visualstudio\.com|vsassets\.io|vo\.msecnd\.net)$/i;
+const esHostMicrosoft = (u) => { try { return MS_HOST_RE.test(new URL(String(u || '')).hostname); } catch (_) { return false; } };
+app.post('/api/marketplace-search', async (req, res) => {
+    try {
+        const query = String((req.body && req.body.query) || '').slice(0, 100);
+        const size = Math.max(1, Math.min(50, parseInt(req.body && req.body.pageSize, 10) || 30));
+        const url = 'https://open-vsx.org/api/-/search?query=' + encodeURIComponent(query) + '&size=' + size;
+        const upstream = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
+        if (!upstream.ok) throw new Error('Open VSX respondió ' + upstream.status);
+        const data = await upstream.json();
+        const resultados = (data.extensions || [])
+            .map((e) => ({
+                uniqueId: 'openvsx-' + (e.namespace || 'x') + '.' + e.name,
+                name: e.displayName || e.name,
+                description: e.description || 'Sin descripción',
+                publisher: e.namespace || 'Desconocido',
+                version: e.version || '1.0.0',
+                icon: (e.files && e.files.icon) || '',
+                downloads: e.downloadCount || 0,
+                source: 'openvsx',
+                vsixUrl: (e.files && e.files.download) || null,
+            }))
+            .filter((x) => x.name && !esHostMicrosoft(x.vsixUrl) && !esHostMicrosoft(x.icon));
+        res.json({ exito: true, resultados });
+    } catch (err) {
+        console.error('Error en /api/marketplace-search:', err.message);
+        res.status(502).json({ exito: false, error: 'No se pudo buscar en Open VSX: ' + err.message });
+    }
 });
 
 app.get('/health', (req, res) => {
