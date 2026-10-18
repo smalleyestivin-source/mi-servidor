@@ -515,7 +515,9 @@ class GestorServicios {
                 body = { language: lenguaje, version: '*', files: [{ content: codigo }] };
                 break;
             case 'Judge0 CE':
-                body = { language_id: this.getLanguageId(normalizarLenguaje(lenguaje)), source_code: codigo };
+                // base64 en ida y vuelta: sin esto, Judge0 responde HTTP 400 si la salida tiene acentos/símbolos raros
+                url += (url.includes('?') ? '&' : '?') + 'base64_encoded=true';
+                body = { language_id: this.getLanguageId(normalizarLenguaje(lenguaje)), source_code: Buffer.from(String(codigo), 'utf8').toString('base64') };
                 break;
             case 'Wandbox':
                 body = { compiler: WANDBOX_COMPILADORES[normalizarLenguaje(lenguaje)] || WANDBOX_COMPILADORES.python, code: codigo, save: false };
@@ -545,6 +547,15 @@ class GestorServicios {
         }
 
         const data = await response.json();
+        if (servicio.nombre === 'Judge0 CE') {
+            const dec = (v) => (v == null ? null : Buffer.from(String(v), 'base64').toString('utf8'));
+            ['stdout', 'stderr', 'compile_output', 'message'].forEach((k) => { if (k in data) data[k] = dec(data[k]); });
+            // Si terminó mal y no dejó texto, se explica con el estado (tiempo agotado, error de ejecución, etc.)
+            if (data.status && data.status.id > 3 && !data.stderr && !data.compile_output) {
+                data.stderr = data.status.description + (data.message ? ': ' + data.message : '');
+            }
+            log(`📦 Judge0 CE: estado=${data.status ? data.status.description : '?'} · stdout=${(data.stdout || '').length} car. · stderr=${(data.stderr || '').length} car.`, 'info');
+        }
         return {
             salida: this.extraerSalida(data),
             error: this.extraerError(data),
