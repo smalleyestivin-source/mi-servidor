@@ -72,6 +72,13 @@ const SERVICIOS = {
         limite: 'Ilimitado',
         lenguajes: ['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php', 'swift', 'kotlin']
     },
+    wandbox: {
+        nombre: 'Wandbox',
+        url: 'https://wandbox.org/api/compile.json',
+        tipo: 'ejecutor',
+        limite: 'Público, sin clave',
+        lenguajes: ['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php', 'swift']
+    },
     jdoodle: {
         nombre: 'JDoodle',
         url: 'https://api.jdoodle.com/v1/execute',
@@ -303,12 +310,38 @@ function resolverApiKey(servicio, apiKeyDelCliente) {
     return apiKeyDelCliente || KEYS_SERVIDOR[servicio.nombre] || '';
 }
 
+// ── Ayudantes del motor (arreglo: nada se cuelga ni se encola para siempre) ──
+// fetch con tiempo máximo (por defecto 20 s): si un servicio no responde, se corta y se prueba otro.
+async function fetchT(url, init, ms) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms || 20000);
+    try {
+        return await fetch(url, Object.assign({}, init, { signal: ctrl.signal }));
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw new Error('Tiempo de espera agotado (' + Math.round((ms || 20000) / 1000) + ' s)');
+        throw e;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+// Servicios de la lista que ya no existen (Heroku gratis cerró, o nunca tuvieron API pública).
+const SERVICIOS_DESACTIVADOS = new Set(['codex', 'replit', 'codeboard', 'codepile', 'codeven']);
+// Servicios que solo sirven si pones sus credenciales en Render → Environment.
+const REQUIERE_ENV = { jdoodle: ['JDOODLE_CLIENT_ID', 'JDOODLE_CLIENT_SECRET'], glot: ['GLOT_TOKEN'] };
+// Nombre del compilador en Wandbox (servicio público, sin clave) por lenguaje.
+const WANDBOX_COMPILADORES = {
+    python: 'cpython-head', javascript: 'nodejs-head', java: 'openjdk-head', c: 'gcc-head-c',
+    cpp: 'gcc-head', go: 'go-head', rust: 'rust-head', ruby: 'ruby-head', php: 'php-head', swift: 'swift-head'
+};
+
 class GestorServicios {
     constructor() {
         this.servicios = SERVICIOS;
         this.estado = {};
         this.carga = {};
         this.cola = [];
+        this.cooldown = {};        // id -> timestamp hasta el que NO se vuelve a probar
+        this.timeoutMs = 20000;    // tiempo máximo por llamada a un servicio
         this.stats = {
             totalPeticiones: 0,
             exitos: 0,
@@ -344,116 +377,94 @@ class GestorServicios {
     }
 
     // ── Verificar un servicio específico ──
+    // Solo comprueba que el servidor responda (cualquier respuesta < 500 cuenta: 401/403/405 son normales
+    // en APIs que piden clave o no aceptan HEAD). Es informativo: ya NO decide a qué servicio se llama.
     async verificarServicio(id) {
         const servicio = this.servicios[id];
         if (!servicio) return false;
-
+        if (SERVICIOS_DESACTIVADOS.has(id)) return false;
         try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 3000);
-
-            let response;
-            switch (servicio.tipo) {
-                case 'ejecutor':
-                    response = await fetch(servicio.url, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            language: 'python',
-                            version: '*',
-                            files: [{ content: 'print(1)' }]
-                        }),
-                        signal: controller.signal
-                    });
-                    break;
-                case 'translate':
-                    response = await fetch(servicio.url, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            q: 'Hello',
-                            source: 'en',
-                            target: 'es'
-                        }),
-                        signal: controller.signal
-                    });
-                    break;
-                default:
-                    response = await fetch(servicio.url, {
-                        method: 'HEAD',
-                        signal: controller.signal
-                    });
-            }
-
-            clearTimeout(timeout);
-            return response.ok;
+            const response = await fetchT(servicio.url, { method: 'HEAD' }, 3000);
+            return response.status < 500;
         } catch {
             return false;
         }
     }
 
+    // ¿Se puede usar este servicio ahora mismo para esta petición?
+    usable(id, datos) {
+        const s = this.servicios[id];
+        if (!s || SERVICIOS_DESACTIVADOS.has(id)) return false;
+        if ((this.cooldown[id] || 0) > Date.now()) return false;
+        const env = REQUIERE_ENV[id];
+        if (env && !env.every((k) => process.env[k])) return false;
+        if (s.tipo === 'ia' && !resolverApiKey(s, datos && datos.apiKey)) return false; // sin clave no hay nada que probar
+        if (s.tipo === 'ejecutor' && s.lenguajes && datos && datos.lenguaje && !s.lenguajes.includes(datos.lenguaje)) return false;
+        return true;
+    }
+
     // ── Elegir el mejor servicio disponible ──
-    elegirServicio(tipo = null) {
-        const disponibles = Object.entries(this.servicios)
-            .filter(([id]) => this.estado[id] === true)
-            .filter(([id, s]) => tipo ? s.tipo === tipo : true);
-
-        if (disponibles.length === 0) return null;
-
-        // Ordenar por carga
-        disponibles.sort((a, b) => {
-            return (this.carga[a[0]] || 0) - (this.carga[b[0]] || 0);
-        });
-
-        const elegido = disponibles[0][0];
+    elegirServicio(tipo = null, datos = null, excluidos = []) {
+        const candidatos = Object.keys(this.servicios)
+            .filter((id) => (tipo ? this.servicios[id].tipo === tipo : true))
+            .filter((id) => !excluidos.includes(id))
+            .filter((id) => this.usable(id, datos));
+        if (candidatos.length === 0) return null;
+        candidatos.sort((a, b) => (this.carga[a] || 0) - (this.carga[b] || 0)); // estable: respeta el orden de la lista
+        const elegido = candidatos[0];
         this.carga[elegido] = (this.carga[elegido] || 0) + 1;
-        
         return elegido;
     }
 
     // ── Ejecutar con múltiples servicios ──
     async ejecutar(tipo, datos) {
         this.stats.totalPeticiones++;
-        
-        // Intentar con servicios disponibles
-        const maxIntentos = 5;
-        let intentos = 0;
-        let ultimoError = null;
+        const maxIntentos = 4;
+        const intentados = [];
+        const errores = [];
 
-        while (intentos < maxIntentos) {
-            const servicioId = this.elegirServicio(tipo);
+        while (intentados.length < maxIntentos) {
+            const servicioId = this.elegirServicio(tipo, datos, intentados);
             if (!servicioId) break;
-
+            intentados.push(servicioId);
             const servicio = this.servicios[servicioId];
-            
+
             try {
                 log(`🔄 Ejecutando en ${servicio.nombre}...`, 'info');
-                
                 const resultado = await this.ejecutarEnServicio(servicioId, datos);
-                
-                // Reducir carga
                 this.carga[servicioId] = Math.max(0, (this.carga[servicioId] || 1) - 1);
                 this.stats.exitos++;
                 this.stats.porServicio[servicioId] = (this.stats.porServicio[servicioId] || 0) + 1;
-                
-                return {
-                    exito: true,
-                    servicio: servicio.nombre,
-                    servicioId: servicioId,
-                    ...resultado
-                };
-                
+                this.estado[servicioId] = true;
+                return { exito: true, servicio: servicio.nombre, servicioId: servicioId, ...resultado };
             } catch (error) {
-                ultimoError = error;
-                this.estado[servicioId] = false;
+                this.carga[servicioId] = Math.max(0, (this.carga[servicioId] || 1) - 1);
+                errores.push(`${servicio.nombre}: ${error.message}`);
                 this.stats.fallos++;
+                // 401/403/404/410 = no va a mejorar pronto (30 min). Lo demás: se reintenta en 1 min.
+                const permanente = [401, 403, 404, 410].includes(error.status);
+                this.cooldown[servicioId] = Date.now() + (permanente ? 30 * 60 * 1000 : 60 * 1000);
+                this.estado[servicioId] = false;
                 log(`⚠️ Falló ${servicio.nombre}: ${error.message}`, 'warning');
-                intentos++;
             }
         }
 
-        // Si todos fallan, encolar
-        return this.encolarPeticion(tipo, datos);
+        // Nada funcionó: se responde YA con el motivo (antes la petición se quedaba esperando para siempre).
+        return { exito: false, error: this.mensajeSinServicio(tipo, intentados.length === 0), intentos: errores };
+    }
+
+    mensajeSinServicio(tipo, ningunoProbado) {
+        if (tipo === 'ia') {
+            return ningunoProbado
+                ? 'No hay ninguna IA configurada en el servidor. Pon al menos GROQ_API_KEY (gratis en console.groq.com) en Render → Environment.'
+                : 'Ninguna IA respondió. Revisa que las claves de Render (GROQ_API_KEY, OPENROUTER_API_KEY...) sean válidas.';
+        }
+        if (tipo === 'ejecutor') {
+            return ningunoProbado
+                ? 'No hay ningún ejecutor de código disponible ahora mismo (algunos fallaron hace poco; se reintentan en 1 min).'
+                : 'Ningún ejecutor de código respondió. Piston público ya exige autorización: si tienes un token pon PISTON_API_KEY (y PISTON_URL si usas otro servidor) en Render.';
+        }
+        return `No hay servicios disponibles para "${tipo}" ahora mismo.`;
     }
 
     // ── Ejecutar en un servicio específico ──
@@ -479,50 +490,47 @@ class GestorServicios {
     // ── Ejecutar código ──
     async ejecutarCodigo(servicio, datos) {
         const { codigo, lenguaje } = datos;
-        
+        const headers = { 'Content-Type': 'application/json' };
+        let url = servicio.url;
         let body;
         switch (servicio.nombre) {
             case 'Piston API':
-                body = {
-                    language: lenguaje,
-                    version: '*',
-                    files: [{ content: codigo }]
-                };
+                // Piston público exige autorización desde feb-2026; si tienes token o tu propio servidor, se usan aquí.
+                if (process.env.PISTON_URL) url = process.env.PISTON_URL;
+                if (process.env.PISTON_API_KEY) headers['Authorization'] = process.env.PISTON_API_KEY;
+                body = { language: lenguaje, version: '*', files: [{ content: codigo }] };
                 break;
             case 'Judge0 CE':
-                body = {
-                    language_id: this.getLanguageId(lenguaje),
-                    source_code: codigo
-                };
+                body = { language_id: this.getLanguageId(lenguaje), source_code: codigo };
+                break;
+            case 'Wandbox':
+                body = { compiler: WANDBOX_COMPILADORES[lenguaje] || WANDBOX_COMPILADORES.python, code: codigo, save: false };
                 break;
             case 'JDoodle':
                 body = {
-                    clientId: datos.clientId || 'TU_CLIENT_ID',
-                    clientSecret: datos.clientSecret || 'TU_SECRET',
-                    script: codigo,
-                    language: lenguaje,
-                    versionIndex: '0'
+                    clientId: process.env.JDOODLE_CLIENT_ID, clientSecret: process.env.JDOODLE_CLIENT_SECRET,
+                    script: codigo, language: lenguaje, versionIndex: '0'
                 };
                 break;
+            case 'Glot.io':
+                headers['Authorization'] = 'Token ' + process.env.GLOT_TOKEN;
+                body = { files: [{ name: 'main', content: codigo }] };
+                break;
             default:
-                body = {
-                    language: lenguaje,
-                    code: codigo
-                };
+                body = { language: lenguaje, code: codigo };
         }
 
-        const response = await fetch(servicio.url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
+        const response = await fetchT(url, { method: 'POST', headers, body: JSON.stringify(body) }, this.timeoutMs);
 
         if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
+            let detalle = '';
+            try { detalle = (await response.text()).replace(/\s+/g, ' ').slice(0, 140); } catch (_) {}
+            const err = new Error(`HTTP ${response.status}${detalle ? ' · ' + detalle : ''}`);
+            err.status = response.status;
+            throw err;
         }
 
         const data = await response.json();
-        
         return {
             salida: this.extraerSalida(data),
             error: this.extraerError(data),
@@ -576,17 +584,21 @@ class GestorServicios {
                 body = { prompt, max_tokens: 500 };
         }
 
-        const response = await fetch(servicio.url, {
+        const response = await fetchT(servicio.url, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${resolverApiKey(servicio, datos.apiKey)}`
             },
             body: JSON.stringify(body)
-        });
+        }, this.timeoutMs);
 
         if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
+            let detalle = '';
+            try { detalle = (await response.text()).replace(/\s+/g, ' ').slice(0, 140); } catch (_) {}
+            const err = new Error(`HTTP ${response.status}${detalle ? ' · ' + detalle : ''}`);
+            err.status = response.status;
+            throw err;
         }
 
         return await response.json();
@@ -758,11 +770,11 @@ class GestorServicios {
     }
 
     extraerSalida(data) {
-        return data.run?.stdout || data.stdout || data.output || data.result || '';
+        return data.run?.stdout || data.stdout || data.program_output || data.output || data.result || '';
     }
 
     extraerError(data) {
-        return data.run?.stderr || data.stderr || data.error || data.compile_output || '';
+        return data.run?.stderr || data.stderr || data.program_error || data.compiler_error || data.error || data.compile_output || '';
     }
 
     // ── Estadísticas ──
