@@ -24,6 +24,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const team = require('./mcp-team'); // equipo de varias IAs (roles, tablero, bloqueos)
 
 // ───────────────────────── Configuración ─────────────────────────
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
@@ -155,6 +156,7 @@ function createBridge(opts) {
   opts = opts || {};
   const sessions = new Map(); // code -> { ws, pending:Map, aiName }
   const badCodes = new Map(); // ip -> { n, t }
+  const teams = team.createStore(); // código -> equipo (tablero, miembros, bloqueos)
 
   function tooManyBadCodes(ip) {
     const now = Date.now();
@@ -259,7 +261,8 @@ function createBridge(opts) {
   }
 
   // ── JSON-RPC de MCP. Devuelve la respuesta, o null si era una notificación ──
-  async function handleRpc(session, msg) {
+  async function handleRpc(session, msg, who) {
+    who = who || team.defaultWho();
     if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
       return { jsonrpc: '2.0', id: msg && msg.id != null ? msg.id : null, error: { code: -32600, message: 'Invalid Request' } };
     }
@@ -280,9 +283,9 @@ function createBridge(opts) {
           protocolVersion: version,
           capabilities: { tools: { listChanged: false } },
           serverInfo: SERVER_INFO,
-          instructions:
+          instructions: team.instructionsFor(who,
             "You are connected to the user's CodeIDE (a code editor on their phone). Use the file tools to read/create/edit project files. " +
-            'ASSISTANT MODE: when the user asks you to "listen" to their IDE assistant, loop: wait_for_user_message → answer with send_to_assistant (use file tools if needed) → wait_for_user_message again, until told to stop.',
+            'ASSISTANT MODE: when the user asks you to "listen" to their IDE assistant, loop: wait_for_user_message → answer with send_to_assistant (use file tools if needed) → wait_for_user_message again, until told to stop.'),
         });
       }
       case 'notifications/initialized':
@@ -291,12 +294,31 @@ function createBridge(opts) {
       case 'ping':
         return ok({});
       case 'tools/list':
-        return ok({ tools: PUBLIC_TOOLS });
+        return ok({ tools: team.toolsFor(who, PUBLIC_TOOLS) });
       case 'tools/call': {
         const name = msg.params && msg.params.name;
-        if (!TOOL_BY_NAME[name]) return fail(-32602, `Unknown tool: ${name}`);
+        const isTeam = team.isTeamTool(name);
+        if (!isTeam && !TOOL_BY_NAME[name]) return fail(-32602, `Unknown tool: ${name}`);
         try {
-          const data = await callIde(session, name, (msg.params && msg.params.arguments) || {});
+          let args = (msg.params && msg.params.arguments) || {};
+          const tm = teams.get(session.code);
+          const perm = team.canCall(who, name, tm);
+          if (!perm.ok) throw new Error(perm.reason);
+          let data;
+          if (isTeam) {
+            // Herramientas del equipo: se resuelven aquí, sin pasar por el IDE
+            data = await team.callTeamTool(tm, who, name, args, {
+              notify: (text) => { callIde(session, 'send_to_assistant', { text }).catch(() => {}); },
+            });
+          } else {
+            if (who.team) team.touch(tm, who);
+            if (team.WRITE_TOOLS.has(name)) {
+              const other = team.lockOwner(tm, args.path, who);
+              if (other) throw new Error(`${args.path} está bloqueado por ${other}. Espera o pídele que lo libere con team_say.`);
+            }
+            if (who.team && name === 'send_to_assistant') args = Object.assign({}, args, { text: `**[${who.nombre} · ${who.rol}]** ` + String(args.text == null ? '' : args.text) });
+            data = await callIde(session, name, args);
+          }
           return ok({
             content: [{ type: 'text', text: typeof data === 'string' ? data : JSON.stringify(data) }],
             isError: false,
@@ -311,7 +333,7 @@ function createBridge(opts) {
     }
   }
 
-  return { sessions, onIdeSocket, handleRpc, tooManyBadCodes, noteBadCode };
+  return { sessions, teams, onIdeSocket, handleRpc, tooManyBadCodes, noteBadCode };
 }
 
 // ───────────────────────── Pegamento con Express + ws ─────────────────────────
@@ -355,7 +377,7 @@ function attachMcpBridge(app, server) {
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
-  router.post('/:code', express.json({ limit: MAX_BODY }), async (req, res) => {
+  router.post('/:code/:rol?/:nombre?', express.json({ limit: MAX_BODY }), async (req, res) => {
     const ip = req.ip || (req.socket && req.socket.remoteAddress) || '?';
     if (bridge.tooManyBadCodes(ip)) return res.status(429).json({ error: 'Too many attempts' });
     const code = String(req.params.code || '').toUpperCase();
@@ -364,22 +386,35 @@ function attachMcpBridge(app, server) {
       bridge.noteBadCode(ip);
       return res.status(404).json({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Código inválido o IDE desconectado' } });
     }
+    const who = team.whoFromParams(req.params.rol, req.params.nombre);
+    if (!who) return res.status(404).json({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Rol o nombre inválido. Roles: lider, constructor, revisor' } });
     try {
       const body = req.body;
       if (Array.isArray(body)) {
-        const out = (await Promise.all(body.map((m) => bridge.handleRpc(session, m)))).filter(Boolean);
+        const out = (await Promise.all(body.map((m) => bridge.handleRpc(session, m, who)))).filter(Boolean);
         return out.length ? res.json(out) : res.sendStatus(202);
       }
-      const out = await bridge.handleRpc(session, body);
+      const out = await bridge.handleRpc(session, body, who);
       return out ? res.json(out) : res.sendStatus(202);
     } catch (e) {
       return res.status(500).json({ jsonrpc: '2.0', id: null, error: { code: -32603, message: 'Internal error' } });
     }
   });
   // GET no se usa (no hay stream del servidor al cliente): 405 es válido según la especificación
-  router.get('/:code', (req, res) => res.status(405).set('Allow', 'POST').end());
+  router.get('/:code/:rol?/:nombre?', (req, res) => res.status(405).set('Allow', 'POST').end());
 
   app.use('/mcp', router);
+
+  // Vista de solo lectura del tablero del equipo (para la futura "zona de proyectos")
+  app.get('/team/:code', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const ip = req.ip || (req.socket && req.socket.remoteAddress) || '?';
+    if (bridge.tooManyBadCodes(ip)) return res.status(429).json({ error: 'Too many attempts' });
+    const code = String(req.params.code || '').toUpperCase();
+    const t = CODE_RE.test(code) ? bridge.teams.peek(code) : null;
+    if (!t) { bridge.noteBadCode(ip); return res.status(404).json({ error: 'Sin equipo para ese código' }); }
+    res.json(team.snapshot(t));
+  });
   console.log('[mcp-bridge] listo: WebSocket /ide-bridge  ·  MCP /mcp/<código>');
   return bridge;
 }
