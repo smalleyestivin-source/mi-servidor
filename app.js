@@ -334,6 +334,15 @@ const WANDBOX_COMPILADORES = {
     cpp: 'gcc-head', go: 'go-head', rust: 'rust-head', ruby: 'ruby-head', php: 'php-head', swift: 'swift-head'
 };
 
+// CodeIDE manda nombres tipo Piston ("c++", "csharp", "bash"...). Se normalizan para los demás servicios.
+const ALIAS_LENGUAJE = {
+    'c++': 'cpp', 'cplusplus': 'cpp', 'js': 'javascript', 'node': 'javascript', 'nodejs': 'javascript',
+    'py': 'python', 'python3': 'python', 'ts': 'typescript', 'c#': 'csharp', 'cs': 'csharp', 'rb': 'ruby',
+    'rs': 'rust', 'golang': 'go', 'sh': 'bash', 'shell': 'bash', 'kt': 'kotlin'
+};
+const normalizarLenguaje = (l) => { const x = String(l || 'python').toLowerCase().trim(); return ALIAS_LENGUAJE[x] || x; };
+const JUDGE0_LENGUAJES = new Set(['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php', 'swift', 'kotlin', 'typescript', 'bash']);
+
 class GestorServicios {
     constructor() {
         this.servicios = SERVICIOS;
@@ -399,7 +408,12 @@ class GestorServicios {
         const env = REQUIERE_ENV[id];
         if (env && !env.every((k) => process.env[k])) return false;
         if (s.tipo === 'ia' && !resolverApiKey(s, datos && datos.apiKey)) return false; // sin clave no hay nada que probar
-        if (s.tipo === 'ejecutor' && s.lenguajes && datos && datos.lenguaje && !s.lenguajes.includes(datos.lenguaje)) return false;
+        if (s.tipo === 'ejecutor' && datos && datos.lenguaje) {
+            const l = normalizarLenguaje(datos.lenguaje);
+            if (id === 'wandbox' && !WANDBOX_COMPILADORES[l]) return false;   // Wandbox solo con estos lenguajes
+            if (id === 'judge0' && !JUDGE0_LENGUAJES.has(l)) return false;    // evita correr "bash" como si fuera Python
+            // Piston y los demás se prueban con cualquier lenguaje: si no lo soportan, responden con un error claro.
+        }
         return true;
     }
 
@@ -501,10 +515,10 @@ class GestorServicios {
                 body = { language: lenguaje, version: '*', files: [{ content: codigo }] };
                 break;
             case 'Judge0 CE':
-                body = { language_id: this.getLanguageId(lenguaje), source_code: codigo };
+                body = { language_id: this.getLanguageId(normalizarLenguaje(lenguaje)), source_code: codigo };
                 break;
             case 'Wandbox':
-                body = { compiler: WANDBOX_COMPILADORES[lenguaje] || WANDBOX_COMPILADORES.python, code: codigo, save: false };
+                body = { compiler: WANDBOX_COMPILADORES[normalizarLenguaje(lenguaje)] || WANDBOX_COMPILADORES.python, code: codigo, save: false };
                 break;
             case 'JDoodle':
                 body = {
@@ -764,7 +778,8 @@ class GestorServicios {
             'php': 68,
             'swift': 83,
             'kotlin': 78,
-            'typescript': 74
+            'typescript': 74,
+            'bash': 46
         };
         return ids[lenguaje] || 71;
     }
