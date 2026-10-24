@@ -1,0 +1,3 @@
+name = "codeide-marketplace"
+main = "cloudflare-worker.js"
+compatibility_date = "2026-10-24"
