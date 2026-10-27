@@ -95,6 +95,55 @@ async function buscarEnPixabay(termino) {
     } catch (e) { return []; }
 }
 
+// --- Motores SIN clave ni registro (gratis): Wikimedia Commons y Openverse ---
+// Devuelven imágenes con licencia abierta; se guarda autor/licencia por si quieres dar crédito.
+const UA = 'CodeIDE/1.0 (buscador de imagenes; https://mi-servidor-v2.onrender.com)';
+async function getJson(url, ms = 8000) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), ms);
+    try {
+        const res = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: ctrl.signal });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return await res.json();
+    } finally { clearTimeout(t); }
+}
+async function buscarEnWikimedia(termino) {
+    try {
+        const url = 'https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrlimit=12'
+            + '&gsrsearch=' + encodeURIComponent(termino)
+            + '&prop=imageinfo&iiprop=url|mime|extmetadata&iiurlwidth=1024&format=json&origin=*';
+        const data = await getJson(url);
+        const paginas = Object.values((data.query && data.query.pages) || {});
+        return paginas
+            .map(p => (p.imageinfo || [])[0])
+            .filter(i => i && /^image\/(jpeg|png|webp|gif)$/.test(i.mime || ''))
+            .slice(0, 10)
+            .map(i => {
+                const m = i.extmetadata || {};
+                return {
+                    url: i.thumburl || i.url,
+                    proveedor: 'wikimedia',
+                    fuente: i.descriptionurl || null,
+                    licencia: (m.LicenseShortName && m.LicenseShortName.value) || null,
+                };
+            });
+    } catch (e) { return []; }
+}
+async function buscarEnOpenverse(termino) {
+    try {
+        const data = await getJson('https://api.openverse.org/v1/images/?page_size=10&q=' + encodeURIComponent(termino));
+        return (data.results || [])
+            .filter(r => r.thumbnail || r.url)
+            .map(r => ({
+                url: r.thumbnail || r.url,
+                proveedor: 'openverse',
+                fuente: r.foreign_landing_url || null,
+                licencia: r.license ? ('CC ' + String(r.license).toUpperCase() + (r.license_version ? ' ' + r.license_version : '')) : null,
+                autor: r.creator || null,
+            }));
+    } catch (e) { return []; }
+}
+
 // --- Categorización simple (heurística por palabras clave, NO es "inteligencia" real) ---
 // Esto solo reordena qué motor aparece primero según el tipo de búsqueda.
 // Es una regla fija que tú puedes ajustar, no un análisis visual de calidad.
@@ -109,10 +158,10 @@ function ordenSegunCategoria(termino) {
     const t = termino.toLowerCase();
     for (const [cat, palabras] of Object.entries(CATEGORIAS)) {
         if (palabras.some(p => t.includes(p))) {
-            if (cat === 'naturaleza' || cat === 'diseño') return ['pixabay', 'unsplash', 'pexels', 'google'];
+            if (cat === 'naturaleza' || cat === 'diseño') return ['pixabay', 'unsplash', 'pexels', 'google', 'wikimedia', 'openverse'];
         }
     }
-    return ['google', 'unsplash', 'pexels', 'pixabay']; // orden por defecto
+    return ['google', 'unsplash', 'pexels', 'pixabay', 'wikimedia', 'openverse']; // orden por defecto
 }
 
 // --- Función principal: consulta TODOS los motores a la vez y junta lo que sí responda ---
@@ -124,20 +173,22 @@ async function buscarImagenes(termino) {
     }
 
     // Paso 2 y 3: todos los motores en paralelo — uno que falle no detiene a los demás
-    const [google, unsplash, pexels, pixabay] = await Promise.all([
+    const [google, unsplash, pexels, pixabay, wikimedia, openverse] = await Promise.all([
         buscarEnGoogle(termino),
         buscarEnUnsplash(termino),
         buscarEnPexels(termino),
         buscarEnPixabay(termino),
+        buscarEnWikimedia(termino),   // sin clave
+        buscarEnOpenverse(termino),   // sin clave
     ]);
 
-    const porProveedor = { google, unsplash, pexels, pixabay };
+    const porProveedor = { google, unsplash, pexels, pixabay, wikimedia, openverse };
     const orden = ordenSegunCategoria(termino);
     let combinados = [];
     for (const proveedor of orden) combinados = combinados.concat(porProveedor[proveedor] || []);
 
     if (combinados.length === 0) {
-        return { exito: false, error: 'Ningún motor configurado devolvió resultados (revisa tus keys)' };
+        return { exito: false, error: 'Ningún motor devolvió resultados para esta búsqueda' };
     }
 
     // Paso 4: guardar el combinado para la próxima vez
