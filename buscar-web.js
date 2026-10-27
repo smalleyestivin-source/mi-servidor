@@ -96,17 +96,64 @@ async function buscarEnSearXNG(termino, categoria = 'general') {
     throw ultimoError || new Error('Ninguna instancia de SearXNG respondió');
 }
 
+
+// ── Respaldo SIN SearXNG: Brave (con clave gratis) y Wikipedia (sin clave) ──
+async function getJsonSimple(url, headers, ms = 8000) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), ms);
+    try {
+        const res = await fetch(url, { headers: Object.assign({ 'User-Agent': 'CodeIDE/1.0 (buscador web; https://mi-servidor-v2.onrender.com)', Accept: 'application/json' }, headers || {}), signal: ctrl.signal });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return await res.json();
+    } finally { clearTimeout(t); }
+}
+const limpiarHtml = (h) => String(h || '').replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+async function buscarEnBrave(termino) {
+    if (!process.env.BRAVE_API_KEY) return [];
+    const data = await getJsonSimple('https://api.search.brave.com/res/v1/web/search?count=10&q=' + encodeURIComponent(termino), { 'X-Subscription-Token': process.env.BRAVE_API_KEY });
+    return ((data.web && data.web.results) || []).slice(0, 10).map(r => ({ titulo: limpiarHtml(r.title), url: r.url, resumen: limpiarHtml(r.description), motor: 'brave' }));
+}
+async function buscarEnWikipedia(termino) {
+    for (const lang of ['es', 'en']) {
+        const url = `https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srlimit=8&format=json&origin=*&srsearch=${encodeURIComponent(termino)}`;
+        const data = await getJsonSimple(url);
+        const lista = ((data.query && data.query.search) || []).map(r => ({
+            titulo: r.title,
+            url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(String(r.title).replace(/ /g, '_'))}`,
+            resumen: limpiarHtml(r.snippet),
+            motor: 'wikipedia-' + lang
+        }));
+        if (lista.length) return lista;
+    }
+    return [];
+}
+
 async function buscarWeb(termino) {
     const enCache = await buscarEnCache(termino, 'web');
     if (enCache) {
         return { exito: true, resultados: enCache.resultados, deCache: true, actualizado: enCache.actualizado };
     }
 
-    let resultado;
+    // Cadena de respaldo: SearXNG (si lo configuraste) → Brave (si pusiste BRAVE_API_KEY) → Wikipedia (gratis, sin clave)
+    let resultado = null;
+    const errores = [];
     try {
         resultado = await buscarEnSearXNG(termino, 'general');
-    } catch (e) {
-        return { exito: false, error: e.message };
+    } catch (e) { errores.push(e.message); }
+    if (!resultado) {
+        try {
+            const r = await buscarEnBrave(termino);
+            if (r.length) resultado = { resultados: r, fuente: 'brave' };
+        } catch (e) { errores.push('Brave: ' + e.message); }
+    }
+    if (!resultado) {
+        try {
+            const r = await buscarEnWikipedia(termino);
+            if (r.length) resultado = { resultados: r, fuente: 'wikipedia' };
+        } catch (e) { errores.push('Wikipedia: ' + e.message); }
+    }
+    if (!resultado) {
+        return { exito: false, error: 'No se encontraron resultados. ' + errores.join(' · ') };
     }
 
     await guardarEnCache(termino, resultado.resultados, resultado.fuente, 'web');
