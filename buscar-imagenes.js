@@ -141,7 +141,7 @@ async function buscarEnOpenverse(termino) {
                 licencia: r.license ? ('CC ' + String(r.license).toUpperCase() + (r.license_version ? ' ' + r.license_version : '')) : null,
                 autor: r.creator || null,
             }));
-    } catch (e) { return []; }
+    } catch (e) { console.error('[openverse] falló: ' + e.message); return []; }
 }
 
 // --- Pinterest (necesita PINTEREST_ACCESS_TOKEN en Render; si no está o no tiene permiso, se omite) ---
@@ -157,15 +157,20 @@ async function buscarEnPinterest(termino) {
             const res = await fetch('https://api.pinterest.com/v5/search/pins?query=' + encodeURIComponent(termino), {
                 headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' }, signal: ctrl.signal
             });
-            if (!res.ok) throw new Error('HTTP ' + res.status);
+            if (!res.ok) {
+                let detalle = '';
+                try { detalle = (await res.text()).replace(/\s+/g, ' ').slice(0, 200); } catch (_) {}
+                throw new Error('HTTP ' + res.status + (detalle ? ' · ' + detalle : ''));
+            }
             data = await res.json();
         } finally { clearTimeout(t); }
+        if (!(data.items || []).length) console.log('[pinterest] respondió bien pero sin resultados para: ' + termino);
         return (data.items || []).slice(0, 10).map(p => {
             const im = (p.media && p.media.images) || {};
             const u = (im['600x'] || im['1200x'] || im['400x300'] || im['150x150'] || {}).url;
             return u ? { url: u, proveedor: 'pinterest', fuente: p.link || null } : null;
         }).filter(Boolean);
-    } catch (e) { return []; }
+    } catch (e) { console.error('[pinterest] falló: ' + e.message); return []; }
 }
 
 // --- Categorización simple (heurística por palabras clave, NO es "inteligencia" real) ---
