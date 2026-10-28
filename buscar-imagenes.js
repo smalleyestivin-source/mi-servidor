@@ -144,6 +144,30 @@ async function buscarEnOpenverse(termino) {
     } catch (e) { return []; }
 }
 
+// --- Pinterest (necesita PINTEREST_ACCESS_TOKEN en Render; si no está o no tiene permiso, se omite) ---
+// OJO: el token NUNCA va escrito en el código. La búsqueda de pines puede requerir acceso aprobado por Pinterest.
+async function buscarEnPinterest(termino) {
+    const token = process.env.PINTEREST_ACCESS_TOKEN;
+    if (!token) return [];
+    try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 8000);
+        let data;
+        try {
+            const res = await fetch('https://api.pinterest.com/v5/search/pins?query=' + encodeURIComponent(termino), {
+                headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' }, signal: ctrl.signal
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            data = await res.json();
+        } finally { clearTimeout(t); }
+        return (data.items || []).slice(0, 10).map(p => {
+            const im = (p.media && p.media.images) || {};
+            const u = (im['600x'] || im['1200x'] || im['400x300'] || im['150x150'] || {}).url;
+            return u ? { url: u, proveedor: 'pinterest', fuente: p.link || null } : null;
+        }).filter(Boolean);
+    } catch (e) { return []; }
+}
+
 // --- Categorización simple (heurística por palabras clave, NO es "inteligencia" real) ---
 // Esto solo reordena qué motor aparece primero según el tipo de búsqueda.
 // Es una regla fija que tú puedes ajustar, no un análisis visual de calidad.
@@ -158,10 +182,10 @@ function ordenSegunCategoria(termino) {
     const t = termino.toLowerCase();
     for (const [cat, palabras] of Object.entries(CATEGORIAS)) {
         if (palabras.some(p => t.includes(p))) {
-            if (cat === 'naturaleza' || cat === 'diseño') return ['pixabay', 'unsplash', 'pexels', 'google', 'wikimedia', 'openverse'];
+            if (cat === 'naturaleza' || cat === 'diseño') return ['pixabay', 'unsplash', 'pexels', 'google', 'pinterest', 'wikimedia', 'openverse'];
         }
     }
-    return ['google', 'unsplash', 'pexels', 'pixabay', 'wikimedia', 'openverse']; // orden por defecto
+    return ['google', 'unsplash', 'pexels', 'pixabay', 'pinterest', 'wikimedia', 'openverse']; // orden por defecto
 }
 
 // --- Función principal: consulta TODOS los motores a la vez y junta lo que sí responda ---
@@ -173,16 +197,17 @@ async function buscarImagenes(termino) {
     }
 
     // Paso 2 y 3: todos los motores en paralelo — uno que falle no detiene a los demás
-    const [google, unsplash, pexels, pixabay, wikimedia, openverse] = await Promise.all([
+    const [google, unsplash, pexels, pixabay, pinterest, wikimedia, openverse] = await Promise.all([
         buscarEnGoogle(termino),
         buscarEnUnsplash(termino),
         buscarEnPexels(termino),
         buscarEnPixabay(termino),
+        buscarEnPinterest(termino),   // solo si hay PINTEREST_ACCESS_TOKEN
         buscarEnWikimedia(termino),   // sin clave
         buscarEnOpenverse(termino),   // sin clave
     ]);
 
-    const porProveedor = { google, unsplash, pexels, pixabay, wikimedia, openverse };
+    const porProveedor = { google, unsplash, pexels, pixabay, pinterest, wikimedia, openverse };
     const orden = ordenSegunCategoria(termino);
     let combinados = [];
     for (const proveedor of orden) combinados = combinados.concat(porProveedor[proveedor] || []);
