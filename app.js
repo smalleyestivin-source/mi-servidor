@@ -1087,6 +1087,13 @@ app.get('/api/buscar-web', async (req, res) => {
     res.json(await buscarWeb(termino));
 });
 
+// ── Búsqueda gratis (misma cadena que /api/buscar-web: SearXNG → Brave → DuckDuckGo → Wikipedia) ──
+app.get('/api/buscar-gratis', async (req, res) => {
+    const termino = req.query.q;
+    if (!termino) return res.status(400).json({ exito: false, error: 'Falta el parámetro ?q=' });
+    res.json(await buscarWeb(termino));
+});
+
 // ── Búsqueda de videos (YouTube, Vimeo, Dailymotion — vía SearXNG) ──
 app.get('/api/buscar-videos', async (req, res) => {
     const termino = req.query.q;
@@ -1125,6 +1132,70 @@ app.post('/api/marketplace-search', async (req, res) => {
     } catch (err) {
         console.error('Error en /api/marketplace-search:', err.message);
         res.status(502).json({ exito: false, error: 'No se pudo buscar en Open VSX: ' + err.message });
+    }
+});
+
+// Palabras para el autocompletado de CodeIDE (un solo archivo, se pide una vez y CodeIDE lo guarda)
+app.get('/api/autocompletado', (req, res) => {
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.sendFile(path.join(__dirname, 'autocomplete.json'), (err) => {
+        if (err && !res.headersSent) res.status(404).json({ error: 'autocomplete.json no está en el servidor' });
+    });
+});
+
+// ── Autocompletado inteligente HTML/CSS/SCSS/LESS (servicios de lenguaje de VS Code) ──
+// Las librerías se cargan al primer uso: si no estuvieran instaladas, el servidor sigue funcionando.
+let _lsp; // undefined = aún no cargado · false = no disponible
+function cargarLsp() {
+    if (_lsp !== undefined) return _lsp;
+    try {
+        const css = require('vscode-css-languageservice');
+        _lsp = {
+            TextDocument: require('vscode-languageserver-textdocument').TextDocument,
+            html: require('vscode-html-languageservice').getLanguageService(),
+            css: { css: css.getCSSLanguageService(), scss: css.getSCSSLanguageService(), less: css.getLESSLanguageService() },
+        };
+    } catch (e) {
+        console.error('[autocompletar] librerías no disponibles: ' + e.message);
+        _lsp = false;
+    }
+    return _lsp;
+}
+app.post('/api/autocompletar', (req, res) => {
+    const { texto, lenguaje, posicion } = req.body || {};
+    if (typeof texto !== 'string' || !texto) return res.json({ sugerencias: [] });
+    if (texto.length > 200000) return res.status(413).json({ error: 'Texto demasiado grande', sugerencias: [] });
+    const lang = String(lenguaje || '').toLowerCase().replace(/^htm$/, 'html');
+    if (!['html', 'css', 'scss', 'less'].includes(lang)) {
+        return res.json({ sugerencias: [], nota: 'Solo HTML, CSS, SCSS y LESS' });
+    }
+    const L = cargarLsp();
+    if (!L) return res.status(503).json({ error: 'El autocompletado inteligente no está instalado en el servidor', sugerencias: [] });
+    try {
+        const doc = L.TextDocument.create('file:///archivo.' + lang, lang, 0, texto);
+        // La posición puede venir como {line, character} (formato LSP) o como un número (posición en el texto)
+        const pos = typeof posicion === 'number'
+            ? doc.positionAt(Math.max(0, Math.min(texto.length, posicion)))
+            : (posicion && Number.isInteger(posicion.line) && Number.isInteger(posicion.character) ? posicion : doc.positionAt(texto.length));
+        let lista;
+        if (lang === 'html') {
+            lista = L.html.doComplete(doc, pos, L.html.parseHTMLDocument(doc));
+        } else {
+            const svc = L.css[lang];
+            lista = svc.doComplete(doc, pos, svc.parseStylesheet(doc));
+        }
+        const sugerencias = ((lista && lista.items) || []).slice(0, 80).map((it) => ({
+            texto: (it.textEdit && it.textEdit.newText) || it.insertText || it.label,
+            etiqueta: it.label,
+            tipo: it.kind,                                   // número de CompletionItemKind (LSP)
+            detalle: it.detail || null,
+            snippet: it.insertTextFormat === 2,              // true = trae marcadores tipo $1 / ${1:valor}
+            reemplaza: it.textEdit && it.textEdit.range ? it.textEdit.range : null,
+        }));
+        res.json({ sugerencias });
+    } catch (e) {
+        console.error('[autocompletar] error:', e.message);
+        res.status(500).json({ error: 'Error al autocompletar', sugerencias: [] });
     }
 });
 
