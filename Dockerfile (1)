@@ -1,0 +1,3 @@
+# Servicio SEPARADO de tu servidor principal: un buscador SearXNG propio para CodeIDE.
+FROM searxng/searxng:latest
+COPY settings.yml /etc/searxng/settings.yml

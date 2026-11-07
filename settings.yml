@@ -1,0 +1,24 @@
+# Configuración de SearXNG para CodeIDE
+use_default_settings: true
+
+general:
+  instance_name: "Buscador CodeIDE"
+  enable_metrics: false
+
+server:
+  # Este valor se reemplaza con la variable de entorno SEARXNG_SECRET que pones en Render.
+  secret_key: "se-reemplaza-con-SEARXNG_SECRET"
+  limiter: false          # el limitador bloquea a tu servidor principal, que es quien consulta
+  public_instance: false
+  image_proxy: false
+
+search:
+  safe_search: 2          # 2 = estricto (tu público incluye menores)
+  autocomplete: ""
+  formats:                # "json" es lo que lee tu servidor; sin esto SearXNG responde 403
+    - html
+    - json
+
+outgoing:
+  request_timeout: 5.0
+  max_request_timeout: 9.0
