@@ -50,7 +50,7 @@ async function guardarEnCache(termino, resultados, fuente, tipo = 'web') {
 }
 
 async function buscarEnUnaInstancia(base, termino, categoria = 'general') {
-    const url = `${base}?q=${encodeURIComponent(termino)}&format=json&categories=${categoria}`;
+    const url = `${base}?q=${encodeURIComponent(termino)}&format=json&categories=${categoria}${busquedaSegura() ? '&safesearch=2' : ''}`;
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), 8000);
     try {
@@ -96,6 +96,20 @@ async function buscarEnSearXNG(termino, categoria = 'general') {
     throw ultimoError || new Error('Ninguna instancia de SearXNG respondió');
 }
 
+
+
+// ── Búsqueda segura (por defecto ACTIVA, porque tu público incluye menores) ──
+// Se apaga SOLO desde Render con BUSQUEDA_SEGURA=off; los usuarios no pueden desactivarla.
+const busquedaSegura = () => String(process.env.BUSQUEDA_SEGURA || 'on').toLowerCase() !== 'off';
+const TERMINOS_BLOQUEADOS = new Set(['porn', 'porno', 'pornografia', 'pornografico', 'xxx', 'sexo', 'sex', 'sexual', 'nude', 'nudes', 'naked',
+    'desnudo', 'desnuda', 'desnudos', 'desnudas', 'nsfw', 'hentai', 'erotico', 'erotica', 'erotic', 'onlyfans', 'milf', 'gore', 'tetas',
+    'puta', 'putas', 'fetish', 'fetiche', 'rule34']);
+// Compara palabra por palabra (así "Essex" o "sexto" no se bloquean por error)
+function terminoBloqueado(termino) {
+    const palabras = String(termino || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    return palabras.some((w) => TERMINOS_BLOQUEADOS.has(w));
+}
+const respuestaBloqueada = () => ({ exito: true, resultados: [], modo_seguro: true, aviso: 'Esta búsqueda no está permitida en el modo seguro.' });
 
 // ── Respaldo SIN SearXNG: Brave (con clave gratis) y Wikipedia (sin clave) ──
 async function getJsonSimple(url, headers, ms = 8000) {
@@ -146,7 +160,7 @@ async function buscarEnDuckDuckGo(termino) {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 8000);
     try {
-        const res = await fetch('https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(termino), {
+        const res = await fetch('https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(termino) + (busquedaSegura() ? '&kp=1' : ''), {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept-Language': 'es,en;q=0.8' }, signal: ctrl.signal
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -162,7 +176,7 @@ async function buscarEnDuckDuckGo(termino) {
 
 async function buscarEnBrave(termino) {
     if (!process.env.BRAVE_API_KEY) return [];
-    const data = await getJsonSimple('https://api.search.brave.com/res/v1/web/search?count=10&q=' + encodeURIComponent(termino), { 'X-Subscription-Token': process.env.BRAVE_API_KEY });
+    const data = await getJsonSimple('https://api.search.brave.com/res/v1/web/search?count=10' + (busquedaSegura() ? '&safesearch=strict' : '') + '&q=' + encodeURIComponent(termino), { 'X-Subscription-Token': process.env.BRAVE_API_KEY });
     return ((data.web && data.web.results) || []).slice(0, 10).map(r => ({ titulo: limpiarHtml(r.title), url: r.url, resumen: limpiarHtml(r.description), motor: 'brave' }));
 }
 async function buscarEnWikipedia(termino) {
@@ -174,6 +188,8 @@ async function buscarEnWikipedia(termino) {
             url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(String(r.title).replace(/ /g, '_'))}`,
             resumen: limpiarHtml(r.snippet),
             motor: 'wikipedia-' + lang,
+            // Para leerlo dentro de tu app (con tu diseño) en vez de mandar al usuario a wikipedia.org
+            articulo_api: '/api/articulo?idioma=' + lang + '&titulo=' + encodeURIComponent(r.title),
             // Crédito obligatorio de la licencia (CC BY-SA): muéstralo en pequeño debajo del resultado.
             fuente: 'Wikipedia',
             licencia: 'CC BY-SA 4.0',
@@ -184,7 +200,106 @@ async function buscarEnWikipedia(termino) {
     return [];
 }
 
+
+// ── Libraries.io: paquetes de Python (PyPI), Ruby, Rust, PHP, .NET, Go, Java... (clave gratis: LIBRARIESIO_API_KEY) ──
+const INSTALAR = {
+    pypi: (n) => `pip install ${n}`, rubygems: (n) => `gem install ${n}`, npm: (n) => `npm install ${n}`, cargo: (n) => `cargo add ${n}`,
+    nuget: (n) => `dotnet add package ${n}`, packagist: (n) => `composer require ${n}`, go: (n) => `go get ${n}`,
+    maven: (n) => `Agrega ${n} a tu pom.xml`, pub: (n) => `dart pub add ${n}`, hex: (n) => `mix deps.get (agrega {:${n}, ...})`,
+};
+const cacheLibs = new Map(); // 10 min en memoria: Libraries.io permite ~60 consultas por minuto
+async function buscarLibrerias(termino, plataforma) {
+    if (busquedaSegura() && terminoBloqueado(termino)) return respuestaBloqueada();
+    const key = process.env.LIBRARIESIO_API_KEY;
+    if (!key) return { exito: false, error: 'Falta LIBRARIESIO_API_KEY (clave gratis en libraries.io, en tu cuenta) en las variables de Render.' };
+    const plat = String(plataforma || '').replace(/[^A-Za-z0-9.]/g, '').slice(0, 20);
+    const ck = (plat + '|' + String(termino).toLowerCase()).slice(0, 150);
+    const c = cacheLibs.get(ck);
+    if (c && Date.now() - c.t < 10 * 60 * 1000) return { exito: true, resultados: c.r, deCache: true };
+    try {
+        const url = 'https://libraries.io/api/search?per_page=10&q=' + encodeURIComponent(termino) + (plat ? '&platforms=' + encodeURIComponent(plat) : '') + '&api_key=' + encodeURIComponent(key);
+        const data = await getJsonSimple(url);
+        const resultados = (Array.isArray(data) ? data : []).slice(0, 10).map((p) => {
+            const f = INSTALAR[String(p.platform || '').toLowerCase()];
+            return {
+                titulo: p.name, plataforma: p.platform, resumen: p.description || '', version: p.latest_release_number || '', estrellas: p.stars || 0,
+                url: p.package_manager_url || p.homepage || p.repository_url || '', repo: p.repository_url || '',
+                instalar: f ? f(p.name) : null, motor: 'libraries.io', fuente: 'Libraries.io', atribucion: 'Fuente: Libraries.io',
+            };
+        });
+        if (resultados.length) cacheLibs.set(ck, { t: Date.now(), r: resultados });
+        return { exito: true, resultados };
+    } catch (e) {
+        return { exito: false, error: 'No se pudo consultar Libraries.io: ' + e.message.replace(key, '***') };
+    }
+}
+
+// ── Lector de artículos de Wikipedia: devuelve el TEXTO por secciones (sin el diseño de Wikipedia) ──
+// El contenido tiene licencia CC BY-SA 4.0: puedes mostrarlo con tu propio diseño, pero debes mostrar el crédito
+// (campo "atribucion") con un enlace al artículo original (campo "url_original").
+const IDIOMAS_WIKI = new Set(['es', 'en', 'pt', 'fr', 'de', 'it']);
+const SECCIONES_FINALES = /^(v[eé]ase tambi[eé]n|referencias|enlaces externos|notas|bibliograf[ií]a|see also|references|external links|further reading|notes|bibliography|voir aussi|r[eé]f[eé]rences|liens externes|siehe auch|einzelnachweise|weblinks|vedi anche|note|collegamenti esterni|ver tamb[eé]m|refer[eê]ncias|liga[cç][oõ]es externas)$/i;
+const cacheArticulos = new Map(); // 1 hora en memoria
+function seccionarExtracto(texto) {
+    const secciones = []; let actual = { titulo: null, nivel: 1, parrafos: [] }; let buf = [];
+    const cerrarParrafo = () => { const t = buf.join(' ').replace(/\s+/g, ' ').trim(); if (t) actual.parrafos.push(t); buf = []; };
+    const cerrarSeccion = () => { cerrarParrafo(); if (actual.parrafos.length) secciones.push(actual); };
+    for (const linea of String(texto || '').split('\n')) {
+        const h = linea.match(/^(={2,6})\s*(.+?)\s*\1\s*$/);
+        if (h) { cerrarSeccion(); actual = { titulo: h[2], nivel: h[1].length - 1, parrafos: [] }; }
+        else if (!linea.trim()) cerrarParrafo();
+        else buf.push(linea.trim());
+    }
+    cerrarSeccion();
+    const out = []; let cortar = false;
+    for (const sec of secciones) {
+        if (sec.titulo && SECCIONES_FINALES.test(sec.titulo)) { if (sec.nivel === 1) cortar = true; continue; }
+        if (cortar && sec.nivel > 1) continue;
+        if (sec.nivel === 1 && sec.titulo) cortar = false;
+        out.push(sec);
+    }
+    return out;
+}
+async function obtenerArticulo(titulo, idioma) {
+    const lang = IDIOMAS_WIKI.has(String(idioma)) ? String(idioma) : 'es';
+    const t = String(titulo || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (!t) return { exito: false, error: 'Falta el parámetro ?titulo=' };
+    if (busquedaSegura() && terminoBloqueado(t)) return respuestaBloqueada();
+    const ck = lang + '|' + t.toLowerCase();
+    const c = cacheArticulos.get(ck);
+    if (c && Date.now() - c.t < 60 * 60 * 1000) return Object.assign({}, c.r, { deCache: true });
+    try {
+        const url = `https://${lang}.wikipedia.org/w/api.php?action=query&format=json&origin=*&redirects=1&prop=extracts|pageimages|info`
+            + `&explaintext=1&exsectionformat=wiki&piprop=thumbnail&pithumbsize=900&inprop=url&titles=${encodeURIComponent(t)}`;
+        const data = await getJsonSimple(url, null, 10000);
+        const page = Object.values((data.query && data.query.pages) || {})[0];
+        if (!page || page.missing !== undefined) return { exito: false, error: 'No se encontró ese artículo' };
+        if (busquedaSegura() && terminoBloqueado(page.title)) return respuestaBloqueada();   // por si un redireccionamiento lleva a un tema bloqueado
+        let secciones = seccionarExtracto(page.extract);
+        let largo = 0, truncado = false;
+        secciones = secciones.slice(0, 40).filter((sec) => { if (largo > 60000) { truncado = true; return false; } largo += sec.parrafos.join('').length; return true; });
+        if (!secciones.length) return { exito: false, error: 'El artículo no tiene texto para mostrar' };
+        const intro = secciones[0].titulo === null ? secciones[0].parrafos[0] : '';
+        const resultado = {
+            exito: true, idioma: lang, titulo: page.title, resumen: intro || '',
+            secciones: secciones.map((sec) => ({ titulo: sec.titulo || 'Introducción', nivel: sec.nivel, parrafos: sec.parrafos })),
+            imagen: (page.thumbnail && page.thumbnail.source) || null,
+            imagen_nota: 'Las imágenes tienen licencias propias: los créditos están en la página original.',
+            url_original: page.fullurl || `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(page.title.replace(/ /g, '_'))}`,
+            historial_url: `https://${lang}.wikipedia.org/w/index.php?title=${encodeURIComponent(page.title.replace(/ /g, '_'))}&action=history`,
+            licencia: 'CC BY-SA 4.0', licencia_url: 'https://creativecommons.org/licenses/by-sa/4.0/',
+            atribucion: 'Adaptado de Wikipedia, la enciclopedia libre · CC BY-SA 4.0', truncado,
+        };
+        if (cacheArticulos.size > 200) cacheArticulos.clear();
+        cacheArticulos.set(ck, { t: Date.now(), r: resultado });
+        return resultado;
+    } catch (e) {
+        return { exito: false, error: 'No se pudo cargar el artículo: ' + e.message };
+    }
+}
+
 async function buscarWeb(termino) {
+    if (busquedaSegura() && terminoBloqueado(termino)) return respuestaBloqueada();
     const enCache = await buscarEnCache(termino, 'web');
     if (enCache) {
         return { exito: true, resultados: enCache.resultados, deCache: true, actualizado: enCache.actualizado };
@@ -297,13 +412,15 @@ function intercalar(listas, max) {
     return out;
 }
 async function buscarVideosSinClave(termino) {
-    const r = await Promise.allSettled([videosNasa(termino), videosWikimedia(termino), videosInternetArchive(termino)]);
+    const seguro = busquedaSegura();
+    const r = await Promise.allSettled([videosNasa(termino), seguro ? Promise.resolve([]) : videosWikimedia(termino), seguro ? Promise.resolve([]) : videosInternetArchive(termino)]);
     const listas = r.map(x => (x.status === 'fulfilled' ? x.value : []));
     const errores = r.filter(x => x.status === 'rejected').map(x => x.reason && x.reason.message);
     return { resultados: intercalar(listas, 12), errores };
 }
 
 async function buscarVideos(termino) {
+    if (busquedaSegura() && terminoBloqueado(termino)) return respuestaBloqueada();
     const enCache = await buscarEnCache(termino, 'videos');
     if (enCache) {
         return { exito: true, resultados: enCache.resultados, deCache: true, actualizado: enCache.actualizado };
@@ -326,4 +443,4 @@ async function buscarVideos(termino) {
     return { exito: true, resultados: resultado.resultados, deCache: false, fuente: resultado.fuente };
 }
 
-module.exports = { buscarWeb, buscarVideos, parsearDuckDuckGoLite };
+module.exports = { buscarWeb, buscarVideos, buscarLibrerias, obtenerArticulo, seccionarExtracto, parsearDuckDuckGoLite, busquedaSegura, terminoBloqueado };
