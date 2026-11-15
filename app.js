@@ -1097,6 +1097,14 @@ try {
     console.error('[lector] no se activó: ' + e.message);
 }
 
+// ── Buscador de videos libres: Dailymotion + Internet Archive (dominio público) + PeerTube (CC) ──
+// GET /api/videos/buscar?q=...  Sin API keys. Si buscar-videos.js faltara, el servidor sigue igual.
+try {
+    require('./buscar-videos').attachBuscadorVideos(app, { rateLimit });
+} catch (e) {
+    console.error('[buscar-videos] no se activó: ' + e.message);
+}
+
 app.get('/api/buscar-web', async (req, res) => {
     const termino = req.query.q;
     if (!termino) return res.status(400).json({ exito: false, error: 'Falta el parámetro ?q=' });
