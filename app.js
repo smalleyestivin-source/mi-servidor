@@ -14,7 +14,7 @@ const os = require('os');
 const { buscarImagenes } = require('./buscar-imagenes');
 const { buscarOEsperar, revisarMatch, cancelarBusqueda } = require('./matchmaking');
 const { iniciarMonitor, agregarRutasMonitor } = require('./agente-monitor');
-const { buscarWeb, buscarVideos } = require('./buscar-web');
+const { buscarWeb, buscarVideos, buscarLibrerias, obtenerArticulo } = require('./buscar-web');
 const vozSilabas = require('./voz-silabas');
 
 const app = express();
@@ -1081,17 +1081,45 @@ app.post('/api/voz-silabas/:vozId/generar', async (req, res) => {
 });
 
 
+// ── Modo lectura: a cada resultado de búsqueda (menos Wikipedia) se le añade un enlace FIRMADO "leer_api".
+// Si el archivo lector.js faltara en el repo, la búsqueda sigue funcionando igual, solo sin ese campo.
+let _lector;
+function conEnlacesDeLectura(r) {
+    try {
+        if (_lector === undefined) _lector = require('./lector');
+        if (_lector && r && Array.isArray(r.resultados)) r.resultados = _lector.agregarEnlacesLectura(r.resultados);
+    } catch (e) { console.error('[lector] no disponible: ' + e.message); _lector = null; }
+    return r;
+}
+try {
+    require('./lector').attachLector(app, { rateLimit });
+} catch (e) {
+    console.error('[lector] no se activó: ' + e.message);
+}
+
 app.get('/api/buscar-web', async (req, res) => {
     const termino = req.query.q;
     if (!termino) return res.status(400).json({ exito: false, error: 'Falta el parámetro ?q=' });
-    res.json(await buscarWeb(termino));
+    res.json(conEnlacesDeLectura(await buscarWeb(termino)));
 });
 
 // ── Búsqueda gratis (misma cadena que /api/buscar-web: SearXNG → Brave → DuckDuckGo → Wikipedia) ──
 app.get('/api/buscar-gratis', async (req, res) => {
     const termino = req.query.q;
     if (!termino) return res.status(400).json({ exito: false, error: 'Falta el parámetro ?q=' });
-    res.json(await buscarWeb(termino));
+    res.json(conEnlacesDeLectura(await buscarWeb(termino)));
+});
+
+// ── Lector de artículos de Wikipedia, para mostrarlos con TU diseño: ?titulo=Luna&idioma=es ──
+app.get('/api/articulo', async (req, res) => {
+    res.json(await obtenerArticulo(req.query.titulo, req.query.idioma));
+});
+
+// ── Búsqueda de librerías de otros lenguajes (Libraries.io): ?q=jwt&plataforma=PyPI (opcional) ──
+app.get('/api/buscar-librerias', async (req, res) => {
+    const termino = req.query.q;
+    if (!termino) return res.status(400).json({ exito: false, error: 'Falta el parámetro ?q=' });
+    res.json(await buscarLibrerias(termino, req.query.plataforma));
 });
 
 // ── Búsqueda de videos (YouTube, Vimeo, Dailymotion — vía SearXNG) ──
@@ -1109,7 +1137,7 @@ const MS_HOST_RE = /(^|\.)(visualstudio\.com|vsassets\.io|vo\.msecnd\.net)$/i;
 const esHostMicrosoft = (u) => { try { return MS_HOST_RE.test(new URL(String(u || '')).hostname); } catch (_) { return false; } };
 app.post('/api/marketplace-search', async (req, res) => {
     try {
-        const query = String((req.body && req.body.query) || '').slice(0, 100);
+        const query = String((req.body && req.body.query) || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim().slice(0, 100); // "Ápk" = "apk"
         const size = Math.max(1, Math.min(50, parseInt(req.body && req.body.pageSize, 10) || 30));
         const url = 'https://open-vsx.org/api/-/search?query=' + encodeURIComponent(query) + '&size=' + size;
         const upstream = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
@@ -1198,6 +1226,13 @@ app.post('/api/autocompletar', (req, res) => {
         res.status(500).json({ error: 'Error al autocompletar', sugerencias: [] });
     }
 });
+
+// ── Revisión de plugins: ZIP seguro + antivirus ClamAV opcional (si falta el archivo, el servidor sigue) ──
+try {
+    require('./plugin-review').attachPluginReview(app, { verificarAppKey, rateLimit, multer });
+} catch (e) {
+    console.error('[plugin-review] no se activó: ' + e.message);
+}
 
 app.get('/health', (req, res) => {
     res.json({
