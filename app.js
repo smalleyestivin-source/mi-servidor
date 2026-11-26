@@ -11,6 +11,10 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+// multer y crypto se cargan AQUÍ ARRIBA (antes estaban al final del archivo y la revisión
+// de plugins fallaba con "Cannot access 'multer' before initialization").
+const crypto = require('crypto');
+const multer = require('multer');
 const { buscarImagenes } = require('./buscar-imagenes');
 const { buscarOEsperar, revisarMatch, cancelarBusqueda } = require('./matchmaking');
 const { iniciarMonitor, agregarRutasMonitor } = require('./agente-monitor');
@@ -19,11 +23,21 @@ const vozSilabas = require('./voz-silabas');
 
 const app = express();
 app.set('trust proxy', 1); // Render va detrás de un proxy: así req.ip es la IP real del visitante
+app.disable('x-powered-by'); // no avisar a todo el mundo que esto es Express
 const PORT = process.env.PORT || 3000;
 
 // ── Middleware ──
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+// Cabeceras de seguridad básicas: el navegador no "adivina" el tipo de archivo (evita que un archivo
+// subido se ejecute como página) y no manda tu dirección a otros sitios.
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    next();
+});
+// Las muestras de voz para clonar son PRIVADAS: nunca se sirven como archivos públicos.
+app.use('/voces/clones', (req, res) => res.sendStatus(404));
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static('public'));
 
 // ── Servidor de señalización PeerJS propio (para GameVerse u otros juegos P2P) ──
@@ -53,16 +67,18 @@ const log = (msg, type = 'info') => {
 };
 
 // ============================================================
-// 1. LISTA DE SERVICIOS GRATUITOS (30+)
+// 1. LISTA DE SERVICIOS GRATUITOS
 // ============================================================
+// (Se quitaron codex, replit, codeboard, codepile y codeven: sus servicios ya no existen
+//  o nunca tuvieron una API pública, así que solo hacían perder tiempo.)
 
 const SERVICIOS = {
-    // ── Ejecutores de código (9 servicios) ──
+    // ── Ejecutores de código (5 servicios) ──
     piston: {
         nombre: 'Piston API',
         url: 'https://emkc.org/api/v2/piston/execute',
         tipo: 'ejecutor',
-        limite: 'Ilimitado',
+        limite: 'Solo con PISTON_API_KEY o tu propio servidor (PISTON_URL)',
         lenguajes: ['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php']
     },
     judge0: {
@@ -86,44 +102,9 @@ const SERVICIOS = {
         limite: '200/día',
         lenguajes: ['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php', 'swift', 'kotlin']
     },
-    codex: {
-        nombre: 'CodeX API',
-        url: 'https://codex-api.herokuapp.com/execute',
-        tipo: 'ejecutor',
-        limite: 'Ilimitado',
-        lenguajes: ['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php']
-    },
-    replit: {
-        nombre: 'Replit API',
-        url: 'https://replit.com/api/v1/execute',
-        tipo: 'ejecutor',
-        limite: '1000/día',
-        lenguajes: ['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php']
-    },
     glot: {
         nombre: 'Glot.io',
         url: 'https://glot.io/api/run',
-        tipo: 'ejecutor',
-        limite: 'Ilimitado',
-        lenguajes: ['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php']
-    },
-    codeboard: {
-        nombre: 'Codeboard',
-        url: 'https://codeboard.io/api/execute',
-        tipo: 'ejecutor',
-        limite: 'Ilimitado',
-        lenguajes: ['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php']
-    },
-    codepile: {
-        nombre: 'CodePile',
-        url: 'https://codepile.com/api/run',
-        tipo: 'ejecutor',
-        limite: 'Ilimitado',
-        lenguajes: ['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php']
-    },
-    codeven: {
-        nombre: 'Codeven',
-        url: 'https://codeven.herokuapp.com/execute',
         tipo: 'ejecutor',
         limite: 'Ilimitado',
         lenguajes: ['python', 'javascript', 'java', 'c', 'cpp', 'go', 'rust', 'ruby', 'php']
@@ -324,8 +305,6 @@ async function fetchT(url, init, ms) {
         clearTimeout(timer);
     }
 }
-// Servicios de la lista que ya no existen (Heroku gratis cerró, o nunca tuvieron API pública).
-const SERVICIOS_DESACTIVADOS = new Set(['codex', 'replit', 'codeboard', 'codepile', 'codeven']);
 // Servicios que solo sirven si pones sus credenciales en Render → Environment.
 const REQUIERE_ENV = { jdoodle: ['JDOODLE_CLIENT_ID', 'JDOODLE_CLIENT_SECRET'], glot: ['GLOT_TOKEN'] };
 // Nombre del compilador en Wandbox (servicio público, sin clave) por lenguaje.
@@ -391,7 +370,6 @@ class GestorServicios {
     async verificarServicio(id) {
         const servicio = this.servicios[id];
         if (!servicio) return false;
-        if (SERVICIOS_DESACTIVADOS.has(id)) return false;
         try {
             const response = await fetchT(servicio.url, { method: 'HEAD' }, 3000);
             return response.status < 500;
@@ -403,10 +381,13 @@ class GestorServicios {
     // ¿Se puede usar este servicio ahora mismo para esta petición?
     usable(id, datos) {
         const s = this.servicios[id];
-        if (!s || SERVICIOS_DESACTIVADOS.has(id)) return false;
+        if (!s) return false;
         if ((this.cooldown[id] || 0) > Date.now()) return false;
         const env = REQUIERE_ENV[id];
         if (env && !env.every((k) => process.env[k])) return false;
+        // El Piston público ya no acepta peticiones sin autorización (HTTP 401 siempre):
+        // solo se usa si pusiste tu propio token (PISTON_API_KEY) o tu propio servidor (PISTON_URL).
+        if (id === 'piston' && !process.env.PISTON_API_KEY && !process.env.PISTON_URL) return false;
         if (s.tipo === 'ia' && !resolverApiKey(s, datos && datos.apiKey)) return false; // sin clave no hay nada que probar
         if (s.tipo === 'ejecutor' && datos && datos.lenguaje) {
             const l = normalizarLenguaje(datos.lenguaje);
@@ -860,18 +841,27 @@ app.get('/', (req, res) => {
 
 // ============================================================
 // SEGURIDAD DE ACCESO — llave propia de tu app + límite de uso
-// Esto protege /api/ejecutar, /api/ia y /api/traducir para que
-// solo tu app (o quien tenga tu APP_KEY) pueda usarlos, y para
+// Esto protege /api/ejecutar, /api/ia, /api/traducir, /api/database, /api/storage y /api/verificar
+// para que solo tu app (o quien tenga tu APP_KEY) pueda usarlos, y para
 // que aunque alguien la copie, no pueda abusar sin límite.
 // ============================================================
 const rateLimit = require('express-rate-limit');
 
 const APP_KEY = process.env.APP_KEY; // ponla en Render → Environment. Distinta a las keys de los proveedores.
+if (!APP_KEY) {
+    console.warn('⚠️ APP_KEY NO está puesta en Render: el servidor está en MODO ABIERTO (cualquiera puede usar /api/ejecutar, /api/ia, etc.). Ponla en Render → Environment y en tu app (cabecera x-app-key).');
+}
+
+// Compara dos textos sin dar pistas por el tiempo que tarda (evita adivinar la llave letra por letra)
+function igualesSeguro(a, b) {
+    const x = crypto.createHash('sha256').update(String(a == null ? '' : a)).digest();
+    const y = crypto.createHash('sha256').update(String(b == null ? '' : b)).digest();
+    return crypto.timingSafeEqual(x, y);
+}
 
 function verificarAppKey(req, res, next) {
     if (!APP_KEY) return next(); // si no configuraste ninguna todavía, no bloquea nada (modo abierto)
-    const key = req.headers['x-app-key'];
-    if (key !== APP_KEY) {
+    if (!igualesSeguro(req.headers['x-app-key'], APP_KEY)) {
         return res.status(401).json({ exito: false, error: 'App key inválida o ausente' });
     }
     next();
@@ -885,7 +875,30 @@ const limitador = rateLimit({
     message: { exito: false, error: 'Demasiadas peticiones, espera un momento' }
 });
 
-app.use(['/api/ejecutar', '/api/ia', '/api/traducir'], verificarAppKey, limitador);
+app.use(['/api/ejecutar', '/api/ia', '/api/traducir', '/api/database', '/api/storage', '/api/verificar'], verificarAppKey, limitador);
+
+// Las búsquedas gastan cuota de servicios con límite (Brave, Libraries.io, Wikipedia...): se limitan por IP.
+const limitadorBusqueda = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { exito: false, error: 'Demasiadas búsquedas, espera un momento' }
+});
+app.use([
+    '/api/buscar-imagenes', '/api/buscar-web', '/api/buscar-gratis', '/api/buscar-librerias',
+    '/api/buscar-videos', '/api/articulo', '/api/marketplace-search', '/api/plugins/antivirus'
+], limitadorBusqueda);
+
+// Voz y traducción en cascada gastan créditos de Fish Audio y otros: límite más estricto.
+const limitadorVoz = rateLimit({
+    windowMs: 60 * 1000,
+    max: 15,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { exito: false, error: 'Demasiadas peticiones de voz, espera un momento' }
+});
+app.use(['/api/tts', '/api/traducir-pro', '/api/narrador', '/api/voces/:id/hablar'], limitadorVoz);
 
 // ── Ejecutar código ──
 app.post('/api/ejecutar', async (req, res) => {
@@ -1111,7 +1124,7 @@ app.get('/api/buscar-web', async (req, res) => {
     res.json(conEnlacesDeLectura(await buscarWeb(termino)));
 });
 
-// ── Búsqueda gratis (misma cadena que /api/buscar-web: SearXNG → Brave → DuckDuckGo → Wikipedia) ──
+// ── Búsqueda gratis (misma cadena que /api/buscar-web: SearXNG → Brave → Wikipedia) ──
 app.get('/api/buscar-gratis', async (req, res) => {
     const termino = req.query.q;
     if (!termino) return res.status(400).json({ exito: false, error: 'Falta el parámetro ?q=' });
@@ -1236,6 +1249,7 @@ app.post('/api/autocompletar', (req, res) => {
 });
 
 // ── Revisión de plugins: ZIP seguro + antivirus ClamAV opcional (si falta el archivo, el servidor sigue) ──
+// (Ahora SÍ se activa: antes fallaba porque `multer` se declaraba más abajo en este archivo.)
 try {
     require('./plugin-review').attachPluginReview(app, { verificarAppKey, rateLimit, multer });
 } catch (e) {
@@ -1567,14 +1581,9 @@ log(`🎭 Personajes: ${Object.keys(PERSONAJES.animados).length + Object.keys(PE
 // ============================================================
 // MÓDULO COMPLETO: BIBLIOTECA DE VOCES — Traductor Pro v4
 // ============================================================
-// INSTRUCCIONES:
-// 1. npm install multer
-// 2. Copiar este código al final de tu app.js
-//    ANTES de cualquier module.exports
+// (multer y crypto ya se cargan arriba, al inicio del archivo)
 // ============================================================
 
-const multer = require('multer');
-const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
 
 // ── Directorio de audios (esto SÍ se borra si Render reinicia el servicio —
@@ -1656,21 +1665,31 @@ async function registrarUso(clave, incremento = 1) {
     return res.value.cantidad;
 }
 
+// ── Borrado de voces: cada voz nueva trae un "token de borrado" secreto ──
+// Antes bastaba con saber el nombre del creador (que es público). Ahora solo se guarda el HASH del token
+// en la base de datos; el token en sí se entrega UNA sola vez, al subir la voz.
+const hashToken = (t) => crypto.createHash('sha256').update(String(t == null ? '' : t)).digest('hex');
+// Nunca se muestra el hash a nadie
+const vozPublica = (v) => { const { hashBorrado, ...resto } = v; return resto; };
+
 // ── Multer: subida de audio ──
+// La extensión del archivo sale del TIPO de audio permitido, nunca del nombre que manda el usuario
+// (si no, alguien podría subir un ".html" disfrazado de audio y se ejecutaría en tu dominio).
+const EXT_AUDIO = { 'audio/webm': '.webm', 'audio/mp4': '.m4a', 'audio/mpeg': '.mp3', 'audio/ogg': '.ogg', 'audio/wav': '.wav', 'audio/aac': '.aac' };
+const extAudio = (mimetype) => EXT_AUDIO[String(mimetype || '').split(';')[0].trim().toLowerCase()] || null;
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, VOICES_DIR),
   filename: (req, file, cb) => {
     const id  = crypto.randomBytes(10).toString('hex');
-    const ext = path.extname(file.originalname) || '.webm';
-    cb(null, `voz_${id}${ext}`);
+    cb(null, `voz_${id}${extAudio(file.mimetype) || '.webm'}`);
   }
 });
 const upload = multer({
   storage,
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
   fileFilter: (req, file, cb) => {
-    const ok = ['audio/webm','audio/mp4','audio/mpeg','audio/ogg','audio/wav','audio/aac'];
-    ok.includes(file.mimetype) ? cb(null, true) : cb(new Error('Solo audio'));
+    extAudio(file.mimetype) ? cb(null, true) : cb(new Error('Solo audio'));
   }
 });
 
@@ -1695,7 +1714,7 @@ app.get('/api/voces', async (req, res) => {
   if (categoria) voces = voces.filter(v => v.categoria === categoria);
   if (idioma)    voces = voces.filter(v => v.idioma    === idioma);
   if (buscar) {
-    const q = buscar.toLowerCase();
+    const q = String(buscar).toLowerCase();
     voces = voces.filter(v =>
       v.nombre.toLowerCase().includes(q) ||
       (v.creador || '').toLowerCase().includes(q) ||
@@ -1709,7 +1728,7 @@ app.get('/api/voces', async (req, res) => {
     const rating = reseñasVoz.length
       ? reseñasVoz.reduce((a, r) => a + r.estrellas, 0) / reseñasVoz.length
       : 0;
-    return { ...v, usos: db.usos[v.id] || 0, rating: parseFloat(rating.toFixed(1)), reviews: reseñasVoz.length };
+    return { ...vozPublica(v), usos: db.usos[v.id] || 0, rating: parseFloat(rating.toFixed(1)), reviews: reseñasVoz.length };
   });
 
   // Ordenar
@@ -1735,7 +1754,7 @@ app.get('/api/voces/:id', async (req, res) => {
 
   res.json({
     exito: true,
-    voz: { ...voz, usos: db.usos[voz.id] || 0, rating: parseFloat(rating.toFixed(1)), reviews: reseñas.length },
+    voz: { ...vozPublica(voz), usos: db.usos[voz.id] || 0, rating: parseFloat(rating.toFixed(1)), reviews: reseñas.length },
     reseñas: reseñas.slice(-10) // últimas 10 reseñas
   });
 });
@@ -1745,6 +1764,7 @@ app.get('/api/voces/:id', async (req, res) => {
 // Form fields: nombre, creador, genero, idioma, categoria,
 //              tipo, limite_diario, descripcion, frases_grabadas
 // File field:  audio
+// Respuesta: incluye "tokenBorrado" (guárdalo: es la ÚNICA vez que se muestra y sirve para borrar la voz)
 // ============================================================
 app.post('/api/voces/subir', limitador, upload.single('audio'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No se recibió audio' });
@@ -1762,29 +1782,31 @@ app.post('/api/voces/subir', limitador, upload.single('audio'), async (req, res)
   } = req.body;
 
   const id = crypto.randomBytes(12).toString('hex');
+  const tokenBorrado = crypto.randomBytes(24).toString('hex');
 
   const voz = {
     id,
-    nombre:          nombre.trim().slice(0, 60),
-    creador:         creador.trim().slice(0, 40),
-    idioma,
-    genero,
-    categoria,
-    descripcion:     descripcion.trim().slice(0, 200),
-    tipo,
+    nombre:          String(nombre).trim().slice(0, 60),
+    creador:         String(creador).trim().slice(0, 40),
+    idioma:          String(idioma).slice(0, 10),
+    genero:          String(genero).slice(0, 20),
+    categoria:       String(categoria).slice(0, 30),
+    descripcion:     String(descripcion).trim().slice(0, 200),
+    tipo:            String(tipo).slice(0, 20),
     limite_diario:   parseInt(limite_diario) || 0,
     frases_grabadas: parseInt(frases_grabadas) || 0,
     archivo:         req.file.filename,
     url:             `/voces/${req.file.filename}`,
     tamaño:          req.file.size,
     fecha:           new Date().toISOString(),
-    activa:          true
+    activa:          true,
+    hashBorrado:     hashToken(tokenBorrado)
   };
 
   await guardarVoz(voz);
 
-  console.log(`🎙️ Nueva voz: "${nombre}" por ${creador} (${idioma}/${genero})`);
-  res.json({ exito: true, voz });
+  console.log(`🎙️ Nueva voz: "${voz.nombre}" por ${voz.creador} (${voz.idioma}/${voz.genero})`);
+  res.json({ exito: true, voz: vozPublica(voz), tokenBorrado });
 });
 
 // ============================================================
@@ -1840,7 +1862,7 @@ app.post('/api/voces/:id/review', async (req, res) => {
 
   const reseñas = await guardarReseña(voz.id, {
     estrellas: stars,
-    comentario: comentario.trim().slice(0, 300),
+    comentario: String(comentario).trim().slice(0, 300),
     fecha: new Date().toISOString()
   });
 
@@ -1854,24 +1876,27 @@ app.post('/api/voces/:id/review', async (req, res) => {
 });
 
 // ============================================================
-// DELETE /api/voces/:id — Eliminar voz (por el creador)
-// Body: { nombre_creador } — verificación básica
+// DELETE /api/voces/:id — Eliminar voz
+// Se necesita UNA de estas dos cosas:
+//   · el token de borrado que se entregó al subir la voz (cabecera x-delete-token, o campo token_borrado en el cuerpo)
+//   · la APP_KEY del servidor (cabecera x-app-key) — para que tú puedas borrar cualquier voz
+// Las voces antiguas (subidas antes de este cambio) no tienen token: solo se borran con la APP_KEY.
 // ============================================================
-app.delete('/api/voces/:id', async (req, res) => {
-  const { nombre_creador } = req.body;
+app.delete('/api/voces/:id', limitador, async (req, res) => {
   const db  = await leerDB();
   const voz = db.voces.find(v => v.id === req.params.id);
   if (!voz) return res.status(404).json({ error: 'No encontrada' });
 
-  // ── Verificación real (antes el comentario lo prometía pero el código
-  // nunca lo revisaba — cualquiera podía borrar la voz de cualquiera) ──
-  if (!nombre_creador || nombre_creador.trim().toLowerCase() !== voz.creador.trim().toLowerCase()) {
-    return res.status(403).json({ error: 'El nombre del creador no coincide, no se puede borrar' });
+  const token = req.headers['x-delete-token'] || (req.body && req.body.token_borrado);
+  const esDueno = Boolean(voz.hashBorrado && token && igualesSeguro(hashToken(token), voz.hashBorrado));
+  const esAdmin = Boolean(APP_KEY && igualesSeguro(req.headers['x-app-key'], APP_KEY));
+  if (!esDueno && !esAdmin) {
+    return res.status(403).json({ error: 'No tienes permiso para borrar esta voz' });
   }
 
   // Eliminar archivo de audio
   try {
-    fs.unlinkSync(path.join(VOICES_DIR, voz.archivo));
+    if (voz.archivo) fs.unlinkSync(path.join(VOICES_DIR, path.basename(String(voz.archivo))));
   } catch(e) { /* ya fue borrado */ }
 
   await eliminarVoz(voz.id);
@@ -1922,16 +1947,25 @@ app.get('/api/voces/stats/resumen', async (req, res) => {
 //  un motor de clonación como Coqui TTS o RVC)
 // Body multipart: audio_0, audio_1 ... audio_7, + metadata
 // ============================================================
+// Seguridad: la carpeta de cada clonación la elige el SERVIDOR (nunca el cliente), el nombre del archivo se
+// limpia, solo se aceptan audios y como máximo 12 archivos. Antes, un "id" malicioso podía escribir fuera de la carpeta.
 const uploadMultiple = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => {
-      const dir = path.join(VOICES_DIR, 'clones', req.body.id || 'tmp');
+      req.cloneId = req.cloneId || crypto.randomBytes(10).toString('hex');
+      const dir = path.join(VOICES_DIR, 'clones', req.cloneId);
       fs.mkdirSync(dir, { recursive: true });
       cb(null, dir);
     },
-    filename: (req, file, cb) => cb(null, file.fieldname + '.webm')
+    filename: (req, file, cb) => {
+      const base = String(file.fieldname || 'audio').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 30) || 'audio';
+      cb(null, base + (extAudio(file.mimetype) || '.webm'));
+    }
   }),
-  limits: { fileSize: 5 * 1024 * 1024 }
+  limits: { fileSize: 5 * 1024 * 1024, files: 12 },
+  fileFilter: (req, file, cb) => {
+    extAudio(file.mimetype) ? cb(null, true) : cb(new Error('Solo audio'));
+  }
 });
 
 // NOTA: igual que los audios normales, estos archivos de clonación viven en
@@ -1978,15 +2012,16 @@ app.post('/api/voces/clonar', limitador, uploadMultiple.any(), async (req, res) 
   }
 
   try {
-    const modelo = await crearVozClonadaFishAudio(req.files, nombre);
+    const modelo = await crearVozClonadaFishAudio(req.files, String(nombre).slice(0, 60));
 
     // Se guarda como una voz más en tu biblioteca de siempre —
     // aparece en /api/voces igual que las demás.
+    const tokenBorrado = crypto.randomBytes(24).toString('hex');
     const voz = {
       id: crypto.randomBytes(12).toString('hex'),
-      nombre,
-      creador,
-      idioma,
+      nombre: String(nombre).slice(0, 60),
+      creador: String(creador).slice(0, 40),
+      idioma: String(idioma).slice(0, 10),
       genero: 'clonada',
       categoria: 'clonada',
       descripcion: `Voz clonada a partir de ${req.files.length} grabación(es)`,
@@ -1994,14 +2029,16 @@ app.post('/api/voces/clonar', limitador, uploadMultiple.any(), async (req, res) 
       fishVoiceId: modelo._id,          // ← esto es lo que la hace real
       estadoClon: modelo.state || 'entrenando',
       fecha: new Date().toISOString(),
-      activa: true
+      activa: true,
+      hashBorrado: hashToken(tokenBorrado)
     };
 
     await guardarVoz(voz);
 
     res.json({
       exito: true,
-      voz,
+      voz: vozPublica(voz),
+      tokenBorrado,
       mensaje: modelo.state === 'ready'
         ? 'Voz clonada y lista para usar ya mismo'
         : 'Voz en entrenamiento — puede tardar unos minutos en estar lista'
@@ -2011,11 +2048,11 @@ app.post('/api/voces/clonar', limitador, uploadMultiple.any(), async (req, res) 
     // Si no hay key de Fish Audio configurada, no truena — se guarda
     // igual que antes (pendiente), como respaldo honesto.
     if (e.message.includes('FISH_AUDIO_API_KEY')) {
-      const id = crypto.randomBytes(10).toString('hex');
+      const id = req.cloneId || crypto.randomBytes(10).toString('hex');
       const clonesDir = path.join(VOICES_DIR, 'clones', id);
       fs.mkdirSync(clonesDir, { recursive: true });
       fs.writeFileSync(path.join(clonesDir, 'meta.json'), JSON.stringify({
-        id, nombre, creador, idioma, archivos: req.files.map(f => f.originalname),
+        id, nombre: String(nombre).slice(0, 60), creador: String(creador).slice(0, 40), idioma: String(idioma).slice(0, 10), archivos: req.files.map(f => f.originalname),
         fecha: new Date().toISOString(), estado: 'pendiente_sin_key'
       }, null, 2));
       return res.json({
@@ -2044,7 +2081,7 @@ app.post('/api/voces/:id/hablar', async (req, res) => {
     const upstream = await fetch('https://api.fish.audio/v1/tts', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: texto, reference_id: voz.fishVoiceId, format: 'mp3' })
+      body: JSON.stringify({ text: String(texto).slice(0, 2000), reference_id: voz.fishVoiceId, format: 'mp3' })
     });
     if (!upstream.ok) throw new Error('Fish Audio respondió ' + upstream.status);
     const buffer = Buffer.from(await upstream.arrayBuffer());
