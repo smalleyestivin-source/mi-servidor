@@ -14,6 +14,10 @@
 // compartir con nadie más). Las siguientes son de respaldo,
 // por si la tuya se cae — pueden ser instancias públicas,
 // más lentas porque las comparte mucha gente, pero gratis.
+//
+// Cadena de respaldo: SearXNG → Brave Search API (oficial, con BRAVE_API_KEY) → Wikipedia (oficial, sin clave).
+// Se quitó el respaldo de DuckDuckGo Lite: era extraer datos de su página web (no una API),
+// fallaba cuando cambiaban el HTML o bloqueaban la IP del servidor, y sus términos no lo permiten.
 // ==========================================================
 
 const { MongoClient } = require('mongodb');
@@ -111,7 +115,7 @@ function terminoBloqueado(termino) {
 }
 const respuestaBloqueada = () => ({ exito: true, resultados: [], modo_seguro: true, aviso: 'Esta búsqueda no está permitida en el modo seguro.' });
 
-// ── Respaldo SIN SearXNG: Brave (con clave gratis) y Wikipedia (sin clave) ──
+// ── Respaldo SIN SearXNG: Brave (con clave) y Wikipedia (sin clave) ──
 async function getJsonSimple(url, headers, ms = 8000) {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), ms);
@@ -122,57 +126,6 @@ async function getJsonSimple(url, headers, ms = 8000) {
     } finally { clearTimeout(t); }
 }
 const limpiarHtml = (h) => String(h || '').replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#039;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
-// ── DuckDuckGo Lite (sin clave, "mejor esfuerzo") ──
-// OJO: es extraer datos de una página web, no una API oficial. Puede dejar de funcionar si DuckDuckGo cambia su HTML
-// o bloquea la IP del servidor, y sus términos pueden no permitir consultas automáticas. Por eso va antes de Wikipedia
-// pero con respaldo: si falla, se salta 10 minutos para no hacer esperar a nadie.
-let ddgBloqueadoHasta = 0;
-const decodificarEntidades = (t) => String(t || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#0?39;|&#x27;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ');
-function urlRealDeDuckDuckGo(href) {
-    let h = decodificarEntidades(href).trim();
-    if (h.startsWith('//')) h = 'https:' + h;
-    try {
-        const u = new URL(h);
-        const real = u.searchParams.get('uddg');          // enlace de redirección: la URL verdadera va en "uddg"
-        if (real) return real;
-        if (/duckduckgo\.com\/y\.js/.test(h)) return null; // anuncio
-        return h;
-    } catch (_) { return null; }
-}
-function parsearDuckDuckGoLite(html) {
-    const out = [];
-    // tolerante al orden de los atributos: busca cada <a ... class='result-link' ...> sea cual sea su orden
-    const reA = /<a\b([^>]*\bclass=['"]result-link['"][^>]*)>([\s\S]*?)<\/a>/gi;
-    let m;
-    while ((m = reA.exec(html)) !== null) {
-        const href = (m[1].match(/\bhref=["']([^"']+)["']/i) || [])[1];
-        const url = href ? urlRealDeDuckDuckGo(href) : null;
-        if (!url) continue;
-        const resto = html.slice(reA.lastIndex, reA.lastIndex + 3000);
-        const sn = resto.match(/<td[^>]*class=['"]result-snippet['"][^>]*>([\s\S]*?)<\/td>/i);
-        const resumen = decodificarEntidades(limpiarHtml(sn ? sn[1] : '')).replace(/\s+/g, ' ').trim();
-        out.push({ titulo: decodificarEntidades(limpiarHtml(m[2])).replace(/\s+/g, ' ').trim(), url, resumen, descripcion: resumen, motor: 'duckduckgo' });
-    }
-    return out;
-}
-async function buscarEnDuckDuckGo(termino) {
-    if (Date.now() < ddgBloqueadoHasta) return [];
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 8000);
-    try {
-        const res = await fetch('https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(termino) + (busquedaSegura() ? '&kp=1' : ''), {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept-Language': 'es,en;q=0.8' }, signal: ctrl.signal
-        });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const lista = parsearDuckDuckGoLite(await res.text()).slice(0, 15);
-        if (!lista.length) throw new Error('sin resultados legibles (¿bloqueo o cambio de formato?)');
-        return lista;
-    } catch (e) {
-        ddgBloqueadoHasta = Date.now() + 10 * 60 * 1000;
-        console.error('[duckduckgo] falló, se salta 10 min: ' + e.message);
-        throw e;
-    } finally { clearTimeout(t); }
-}
 
 async function buscarEnBrave(termino) {
     if (!process.env.BRAVE_API_KEY) return [];
@@ -319,12 +272,6 @@ async function buscarWeb(termino) {
     }
     if (!resultado) {
         try {
-            const r = await buscarEnDuckDuckGo(termino);
-            if (r.length) resultado = { resultados: r, fuente: 'duckduckgo' };
-        } catch (e) { errores.push('DuckDuckGo: ' + e.message); }
-    }
-    if (!resultado) {
-        try {
             const r = await buscarEnWikipedia(termino);
             if (r.length) resultado = { resultados: r, fuente: 'wikipedia' };
         } catch (e) { errores.push('Wikipedia: ' + e.message); }
@@ -443,4 +390,4 @@ async function buscarVideos(termino) {
     return { exito: true, resultados: resultado.resultados, deCache: false, fuente: resultado.fuente };
 }
 
-module.exports = { buscarWeb, buscarVideos, buscarLibrerias, obtenerArticulo, seccionarExtracto, parsearDuckDuckGoLite, busquedaSegura, terminoBloqueado };
+module.exports = { buscarWeb, buscarVideos, buscarLibrerias, obtenerArticulo, seccionarExtracto, busquedaSegura, terminoBloqueado };
