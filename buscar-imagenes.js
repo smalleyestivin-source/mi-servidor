@@ -3,6 +3,8 @@
 // permanente en MongoDB (ya no se borra al reiniciar el servidor).
 // ==========================================================
 const { MongoClient } = require('mongodb');
+// Mismo modo seguro que la búsqueda web (BUSQUEDA_SEGURA=off en Render lo apaga; por defecto está ACTIVO)
+const { busquedaSegura, terminoBloqueado } = require('./buscar-web');
 
 // --- Configuración (variables de entorno, nunca aquí en texto) ---
 // En Render → Environment:
@@ -87,7 +89,7 @@ async function buscarEnPexels(termino) {
 async function buscarEnPixabay(termino) {
     if (!PIXABAY_API_KEY) return [];
     try {
-        const url = `https://pixabay.com/api/?key=${PIXABAY_API_KEY}&q=${encodeURIComponent(termino)}&image_type=photo&per_page=10`;
+        const url = `https://pixabay.com/api/?key=${PIXABAY_API_KEY}&q=${encodeURIComponent(termino)}&image_type=photo&per_page=10${busquedaSegura() ? '&safesearch=true' : ''}`;
         const res = await fetch(url);
         if (!res.ok) return [];
         const data = await res.json();
@@ -95,7 +97,7 @@ async function buscarEnPixabay(termino) {
     } catch (e) { return []; }
 }
 
-// --- Motores SIN clave ni registro (gratis): Wikimedia Commons y Openverse ---
+// --- Motores SIN clave ni registro (gratis): Wikimedia Commons, Openverse y NASA ---
 // Devuelven imágenes con licencia abierta; se guarda autor/licencia por si quieres dar crédito.
 const UA = 'CodeIDE/1.0 (buscador de imagenes; https://mi-servidor-v2.onrender.com)';
 async function getJson(url, ms = 8000) {
@@ -143,34 +145,24 @@ async function buscarEnOpenverse(termino) {
             }));
     } catch (e) { console.error('[openverse] falló: ' + e.message); return []; }
 }
-
-// --- Pinterest (necesita PINTEREST_ACCESS_TOKEN en Render; si no está o no tiene permiso, se omite) ---
-// OJO: el token NUNCA va escrito en el código. La búsqueda de pines puede requerir acceso aprobado por Pinterest.
-async function buscarEnPinterest(termino) {
-    const token = process.env.PINTEREST_ACCESS_TOKEN;
-    if (!token) return [];
+// NASA Image and Video Library — API oficial y pública de la NASA, sin clave.
+// (Reemplaza a Pinterest, que respondía 401 en cada búsqueda.)
+async function buscarEnNasa(termino) {
     try {
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), 8000);
-        let data;
-        try {
-            const res = await fetch('https://api.pinterest.com/v5/search/pins?query=' + encodeURIComponent(termino), {
-                headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' }, signal: ctrl.signal
-            });
-            if (!res.ok) {
-                let detalle = '';
-                try { detalle = (await res.text()).replace(/\s+/g, ' ').slice(0, 200); } catch (_) {}
-                throw new Error('HTTP ' + res.status + (detalle ? ' · ' + detalle : ''));
-            }
-            data = await res.json();
-        } finally { clearTimeout(t); }
-        if (!(data.items || []).length) console.log('[pinterest] respondió bien pero sin resultados para: ' + termino);
-        return (data.items || []).slice(0, 10).map(p => {
-            const im = (p.media && p.media.images) || {};
-            const u = (im['600x'] || im['1200x'] || im['400x300'] || im['150x150'] || {}).url;
-            return u ? { url: u, proveedor: 'pinterest', fuente: p.link || null } : null;
+        const data = await getJson('https://images-api.nasa.gov/search?media_type=image&q=' + encodeURIComponent(termino));
+        const items = ((data.collection && data.collection.items) || []).slice(0, 10);
+        return items.map((it) => {
+            const d = (it.data || [])[0] || {};
+            const l = (it.links || [])[0] || {};
+            if (!l.href) return null;
+            return {
+                url: String(l.href).replace(/^http:/, 'https:'),
+                proveedor: 'nasa',
+                fuente: 'https://images.nasa.gov/details/' + encodeURIComponent(d.nasa_id || ''),
+                licencia: 'NASA: mayormente dominio público (revisa sus términos)',
+            };
         }).filter(Boolean);
-    } catch (e) { console.error('[pinterest] falló: ' + e.message); return []; }
+    } catch (e) { console.error('[nasa] falló: ' + e.message); return []; }
 }
 
 // --- Categorización simple (heurística por palabras clave, NO es "inteligencia" real) ---
@@ -187,14 +179,22 @@ function ordenSegunCategoria(termino) {
     const t = termino.toLowerCase();
     for (const [cat, palabras] of Object.entries(CATEGORIAS)) {
         if (palabras.some(p => t.includes(p))) {
-            if (cat === 'naturaleza' || cat === 'diseño') return ['pixabay', 'unsplash', 'pexels', 'google', 'pinterest', 'wikimedia', 'openverse'];
+            if (cat === 'naturaleza' || cat === 'diseño') return ['pixabay', 'unsplash', 'pexels', 'google', 'wikimedia', 'openverse', 'nasa'];
         }
     }
-    return ['google', 'unsplash', 'pexels', 'pixabay', 'pinterest', 'wikimedia', 'openverse']; // orden por defecto
+    return ['google', 'unsplash', 'pexels', 'pixabay', 'wikimedia', 'openverse', 'nasa']; // orden por defecto
 }
 
 // --- Función principal: consulta TODOS los motores a la vez y junta lo que sí responda ---
-async function buscarImagenes(termino) {
+async function buscarImagenes(terminoOriginal) {
+    const termino = String(terminoOriginal || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (!termino) return { exito: false, error: 'Falta el término de búsqueda' };
+
+    // Modo seguro (tu público incluye menores): mismas palabras bloqueadas que en la búsqueda web
+    if (busquedaSegura() && terminoBloqueado(termino)) {
+        return { exito: true, resultados: [], modo_seguro: true, aviso: 'Esta búsqueda no está permitida en el modo seguro.' };
+    }
+
     // Paso 1: caché permanente primero
     const enCache = await buscarEnCache(termino);
     if (enCache) {
@@ -202,17 +202,17 @@ async function buscarImagenes(termino) {
     }
 
     // Paso 2 y 3: todos los motores en paralelo — uno que falle no detiene a los demás
-    const [google, unsplash, pexels, pixabay, pinterest, wikimedia, openverse] = await Promise.all([
+    const [google, unsplash, pexels, pixabay, wikimedia, openverse, nasa] = await Promise.all([
         buscarEnGoogle(termino),
         buscarEnUnsplash(termino),
         buscarEnPexels(termino),
         buscarEnPixabay(termino),
-        buscarEnPinterest(termino),   // solo si hay PINTEREST_ACCESS_TOKEN
         buscarEnWikimedia(termino),   // sin clave
         buscarEnOpenverse(termino),   // sin clave
+        buscarEnNasa(termino),        // sin clave (API oficial de la NASA)
     ]);
 
-    const porProveedor = { google, unsplash, pexels, pixabay, pinterest, wikimedia, openverse };
+    const porProveedor = { google, unsplash, pexels, pixabay, wikimedia, openverse, nasa };
     const orden = ordenSegunCategoria(termino);
     let combinados = [];
     for (const proveedor of orden) combinados = combinados.concat(porProveedor[proveedor] || []);
